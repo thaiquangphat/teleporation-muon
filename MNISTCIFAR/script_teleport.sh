@@ -22,6 +22,6 @@ python3 src/train.py --seed 3 --dataset "CIFAR10" --img-size 32 --num_channels 3
 # #CIFAR-10 Teleport Muon
 python3 src/train.py --seed 3 --dataset "CIFAR10" --img-size 32 --num_channels 3 --num-classes 10 \
   --batch-size 256 --epochs 50 --d-model 192 --intermediate-size 768 --num-heads 3 --position-embedding "rope" \
-  --opt "sgd" --lr 0.005 --momentum 0.9 --weight_decay 1e-5 \
+  --opt "muon" --lr 0.005 --momentum 0.9 --weight_decay 1e-5 \
   --tele-att 1 --tele-mlp 0 --tele-opt 1 --tele-sign 0 --tele-layer "all" \
   --n-teleport 16 --tele-batch 4 --tele-cons 4 --tele-high 1.65 --tele-low 0.35 --tele-epoch-array 1
