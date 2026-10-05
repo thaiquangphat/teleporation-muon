@@ -11,7 +11,7 @@ from muon import create_muon_optimizer
 from datamodule import get_dataset
 from teleport import try_teleportation, generate_tele_scheduler, calculate_grad_L2
 from model import ViTRoPEForImageClassification
-from training_logger import TrainingLogger
+from logger import TrainingLogger
 
 def list_of_ints(arg):
     return [int(x) for x in arg.split(',')]

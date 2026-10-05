@@ -1,9 +1,7 @@
 import argparse
 import os
+import time
 import torch
-import wandb
-import random
-import numpy as np
 from torch import nn
 from tqdm import tqdm
 from torch.optim import AdamW, SGD
@@ -12,8 +10,9 @@ from transformers import ViTConfig, ViTForImageClassification
 from muon import create_muon_optimizer
 from model import ViTRoPEForImageClassification
 from datasets import build_dataset
-from teleport import try_teleportation, generate_tele_scheduler, calculate_grad_L2
+from teleport import try_teleportation, generate_tele_scheduler
 from utils import set_seed, save_checkpoint, remove_old_checkpoints
+from logger import TrainingLogger
 
 # ---------- Dataset Loader ----------
 def data_loader(args):
@@ -33,20 +32,15 @@ def data_loader(args):
     return data_loader_train, data_loader_val
 
 def main(args: argparse.Namespace):
-    # Init wandb
-    wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        group=args.wandb_group,
-        id=args.wandb_id,
-        name=f"lr{args.lr}-warmup{args.warmup_lr}-{args.opt}-teleport{args.n_teleport}-batch{args.tele_batch}-att{args.tele_att}-mlp{args.tele_mlp}"
-            f"-{args.tele_opt}-high{args.tele_high}-low{args.tele_low}-start{args.tele_start}-limit{args.tele_limit}-sign{args.tele_sign}",
-        save_code=True,
+    run_name = (
+        f"lr{args.lr}-warmup{args.warmup_lr}-{args.opt}"
+        f"-teleport{args.n_teleport}-batch{args.tele_batch}"
+        f"-att{args.tele_att}-mlp{args.tele_mlp}-tele-opt{args.tele_opt}"
+        f"-high{args.tele_high}-low{args.tele_low}"
+        f"-start{args.tele_start}-limit{args.tele_limit}-sign{args.tele_sign}"
     )
-    save_path = os.path.join(args.save_dir,wandb.run.name)
-    wandb.config.update(vars(args))
     set_seed(args.seed)
-    save_path = os.path.join(args.save_dir, wandb.run.name)
+    save_path = os.path.join(args.save_dir, run_name)
     os.makedirs(save_path, exist_ok=True)
     # === Model and Data  ===
     config = ViTConfig(
@@ -87,7 +81,7 @@ def main(args: argparse.Namespace):
     warmup_scheduler = LinearLR(optimizer, start_factor=start_factor, end_factor=1.0, total_iters=args.warmup_epochs)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=args.eta_min)
     scheduler = SequentialLR(optimizer,schedulers=[warmup_scheduler, cosine_scheduler],milestones=[args.warmup_epochs])
-    curr_epoch, best_acc = 1, 0.0
+    curr_epoch, best_acc, best_epoch = 1, 0.0, 0
     if(args.restore_path):
         checkpoint = torch.load(args.restore_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -95,78 +89,119 @@ def main(args: argparse.Namespace):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         curr_epoch = checkpoint['epoch'] + 1  # resume after saved epoch
         best_acc = checkpoint['val_acc']
+        best_epoch = checkpoint['epoch']
         current_lr = checkpoint['learning_rate']
     # Teleport Setting
     tele_scheduler = generate_tele_scheduler(tele_batch=args.tele_batch, number_of_batch=len(train_loader),tele_opt=args.tele_opt,tele_cons=args.tele_cons)    
     # Training Setting
     criterion = nn.CrossEntropyLoss()
     global_step = (curr_epoch-1)*len(train_loader)
+    gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
+    logger = TrainingLogger(
+        save_dir=save_path,
+        run_name=run_name,
+        config=vars(args),
+        environment={
+            "device": str(device),
+            "gpu_name": gpu_name,
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+        },
+        dataset={
+            "name": args.data_set,
+            "train_samples": len(train_loader.dataset),
+            "validation_samples": len(val_loader.dataset),
+            "train_batches_per_epoch": len(train_loader),
+            "validation_batches_per_epoch": len(val_loader),
+        },
+        model={
+            "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+        },
+    )
     print("Starting training...")
-    for epoch in range(curr_epoch, args.epochs+1):
-        model.train()
-        train_loss, train_acc = 0.0, 0.0
-        progress_bar = tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")
-        for batch_idx, (images, labels) in enumerate(progress_bar):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(pixel_values=images).logits
-            if(args.n_teleport and tele_scheduler[batch_idx] and (epoch)%args.tele_epoch == 0  and args.tele_start<= epoch <= args.tele_limit):
-                try_teleportation(
-                    vit_model=model, criterion=lambda logits, target: criterion(logits, target), samples=images,targets=labels,args = args,
-                    high = args.tele_high, low = args.tele_low, sign = args.tele_sign
-                )                
-            loss = criterion(outputs, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            grad_L2 = calculate_grad_L2(model)
-            optimizer.step()
-            preds = outputs.argmax(dim=1)
-            train_loss_step = loss.item()
-            train_acc_step  = (preds == labels).sum().item()*100/ labels.size(0)
-            train_loss += train_loss_step
-            train_acc  += train_acc_step
-            if global_step % args.logs_frequency == 0 and global_step > 0:
-                wandb.log({"train_loss_step": train_loss_step, "train_acc_step": train_acc_step,"grad_L2_step": grad_L2}, step=global_step)
-            # Update postfix for tqdm
-            progress_bar.set_postfix({
-                "loss": f"{train_loss_step:.4f}", "acc":f"{train_acc_step:.4f}", "grad_L2": f"{grad_L2:.4f}","lr": f"{optimizer.param_groups[0]['lr']:.6f}"
-            })
-            global_step += 1
-        avg_train_loss = train_loss / len(train_loader)
-        avg_train_acc = train_acc / len(train_loader)
-        current_lr = optimizer.param_groups[0]["lr"]
-        # === Validation ===
-        model.eval()
-        correct, total = 0, 0
-        val_loss = 0.0
-        with torch.no_grad():
-            for images, labels in val_loader:
+    with logger:
+        for epoch in range(curr_epoch, args.epochs+1):
+            epoch_started = time.perf_counter()
+            model.train()
+            train_loss, train_acc = 0.0, 0.0
+            progress_bar = tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")
+            for batch_idx, (images, labels) in enumerate(progress_bar):
                 images, labels = images.to(device), labels.to(device)
                 outputs = model(pixel_values=images).logits
+                if(args.n_teleport and tele_scheduler[batch_idx] and (epoch)%args.tele_epoch == 0  and args.tele_start<= epoch <= args.tele_limit):
+                    try_teleportation(
+                        vit_model=model, criterion=lambda logits, target: criterion(logits, target), samples=images,targets=labels,args = args,
+                        high = args.tele_high, low = args.tele_low, sign = args.tele_sign
+                    )
                 loss = criterion(outputs, labels)
-                val_loss += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
                 preds = outputs.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-        avg_val_acc = correct / total
-        avg_val_loss = val_loss / len(val_loader)
-        print(f"Epoch {epoch}, Train Loss:{avg_train_loss:.4f}, Train Acc:{avg_train_acc:.2f}, Val Loss:{avg_val_loss:.4f}, Val Acc:{avg_val_acc*100 :.2f}%, LR:{current_lr:.4f}")
-        wandb.log({
-            "train_loss": avg_train_loss, "train_acc":avg_train_acc, "val_acc": avg_val_acc,"val_loss": avg_val_loss,
-            "learning_rate": current_lr, "epoch": epoch}, step=global_step
-        )
-        # Step the LR scheduler
-        scheduler.step()
-        # Save last checkpoint
-        remove_old_checkpoints(save_path, "last_")
-        last_path = os.path.join(save_path, f"last_{epoch}.pt")
-        save_checkpoint(last_path, model, optimizer, scheduler, epoch, best_acc, scheduler.get_last_lr()[0])
-        # Save best checkpoint if improved
-        if avg_val_acc > best_acc:
-            best_acc = avg_val_acc
-            remove_old_checkpoints(save_path, "best_")
-            best_path = os.path.join(save_path, f"best_{epoch}.pt")
-            save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_acc, scheduler.get_last_lr()[0])
-            print(f"Best model saved at epoch {epoch}")
+                train_loss_step = loss.item()
+                train_acc_step  = (preds == labels).sum().item()*100/ labels.size(0)
+                train_loss += train_loss_step
+                train_acc  += train_acc_step
+                progress_bar.set_postfix({
+                    "loss": f"{train_loss_step:.4f}", "acc":f"{train_acc_step:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
+                })
+                global_step += 1
+            train_time_seconds = time.perf_counter() - epoch_started
+            avg_train_loss = train_loss / len(train_loader)
+            avg_train_acc = train_acc / len(train_loader)
+            current_lr = optimizer.param_groups[0]["lr"]
+            # === Validation ===
+            validation_started = time.perf_counter()
+            model.eval()
+            correct, total = 0, 0
+            val_loss = 0.0
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    outputs = model(pixel_values=images).logits
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    preds = outputs.argmax(dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+            validation_time_seconds = time.perf_counter() - validation_started
+            avg_val_acc = correct / total
+            avg_val_loss = val_loss / len(val_loader)
+            print(f"Epoch {epoch}, Train Loss:{avg_train_loss:.4f}, Train Acc:{avg_train_acc:.2f}, Val Loss:{avg_val_loss:.4f}, Val Acc:{avg_val_acc*100 :.2f}%, LR:{current_lr:.4f}")
+            # Step the LR scheduler
+            scheduler.step()
+            # Save last checkpoint
+            remove_old_checkpoints(save_path, "last_")
+            last_path = os.path.join(save_path, f"last_{epoch}.pt")
+            save_checkpoint(last_path, model, optimizer, scheduler, epoch, best_acc, scheduler.get_last_lr()[0])
+            # Save best checkpoint if improved
+            if avg_val_acc > best_acc:
+                best_acc = avg_val_acc
+                best_epoch = epoch
+                remove_old_checkpoints(save_path, "best_")
+                best_path = os.path.join(save_path, f"best_{epoch}.pt")
+                save_checkpoint(best_path, model, optimizer, scheduler, epoch, best_acc, scheduler.get_last_lr()[0])
+                print(f"Best model saved at epoch {epoch}")
+
+            epoch_time_seconds = time.perf_counter() - epoch_started
+            logger.log_epoch(
+                {
+                    "epoch": epoch,
+                    "train_loss": avg_train_loss,
+                    "train_acc": avg_train_acc,
+                    "val_loss": avg_val_loss,
+                    "val_acc": avg_val_acc,
+                    "lr": current_lr,
+                    "next_lr": optimizer.param_groups[0]["lr"],
+                    "train_time_seconds": round(train_time_seconds, 6),
+                    "validation_time_seconds": round(validation_time_seconds, 6),
+                    "epoch_time_seconds": round(epoch_time_seconds, 6),
+                    "global_step": global_step,
+                },
+                best_val_acc=best_acc,
+                best_epoch=best_epoch,
+            )
+    print(f"Training log: {logger.log_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train ViT on CIFAR-10")
@@ -206,11 +241,6 @@ if __name__ == "__main__":
     # Save and Logging
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--restore-path", type=str, default=None)
-    parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--wandb-group", type=str, default=None)
-    parser.add_argument("--wandb-entity", type=str, default=None, help="wandb entity for logging")
-    parser.add_argument("--wandb-id", type=str, default=None, help="wandb id for logging")
-    parser.add_argument("--logs-frequency", type=int, default=50, help="Log training loss every N steps")
     # Teleport Hyperparams
     parser.add_argument('--n-teleport', type=int, default=2, help='number of teleport')
     parser.add_argument('--tele-epoch', type=int, default=2, help='Distance of teleports')
