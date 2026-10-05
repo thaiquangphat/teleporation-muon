@@ -24,7 +24,7 @@ class TrainingLogger:
             f"{datetime.now().astimezone().strftime('%Y%m%dT%H%M%S')}_"
             f"{uuid.uuid4().hex[:8]}"
         )
-        self.log_path = self.save_dir / f"training_log_{self.run_id}.json"
+        self.log_path = self.save_dir / f"log.json"
         self._start_time = time.perf_counter()
         self.data: dict[str, Any] = {
             "schema_version": 1,
