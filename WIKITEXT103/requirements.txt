@@ -1,0 +1,5 @@
+torch
+torchvision
+tqdm
+wandb
+transformers==4.30.2

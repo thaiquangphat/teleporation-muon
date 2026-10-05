@@ -1,0 +1,5 @@
+torch
+torchvision
+tqdm
+transformers==4.56.1
+labml_nn
