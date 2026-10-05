@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 import torch
 from torch import nn
 from torch.optim import AdamW, SGD
@@ -10,6 +11,7 @@ from muon import create_muon_optimizer
 from datamodule import get_dataset
 from teleport import try_teleportation, generate_tele_scheduler, calculate_grad_L2
 from model import ViTRoPEForImageClassification
+from training_logger import TrainingLogger
 
 def list_of_ints(arg):
     return [int(x) for x in arg.split(',')]
@@ -138,74 +140,126 @@ def main():
     criterion = nn.CrossEntropyLoss()
     global_step = 0
     best_acc = 0.0
-    for epoch in range(1, args.epochs+1):
-        model.train()
-        running_loss = 0.0
-        for i, (images, labels) in enumerate(tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")):
-            images, labels = images.to(device), labels.to(device)
-            
-            # === Optional Teleportation ===
-            if (args.n_teleport > 0) and tele_scheduler[i] and epoch in args.tele_epoch_array:
-                try_teleportation(
-                    vit_model=model,
-                    criterion=lambda logits, target: criterion(logits, target),
-                    samples=images,
-                    targets=labels,
-                    args = args,
-                    high = args.tele_high,
-                    low = args.tele_low,
-                    sign = args.tele_sign
-                )
+    best_epoch = 0
+    gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
+    logger = TrainingLogger(
+        save_dir=save_dir,
+        run_name=run_name,
+        config=vars(args),
+        environment={
+            "device": str(device),
+            "gpu_name": gpu_name,
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+        },
+        dataset={
+            "name": args.dataset,
+            "train_samples": len(train_loader.dataset),
+            "validation_samples": len(val_loader.dataset),
+            "train_batches_per_epoch": len(train_loader),
+            "validation_batches_per_epoch": len(val_loader),
+        },
+        model={
+            "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+        },
+    )
 
-            outputs = model(pixel_values=images).logits
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            running_loss += loss.item()
-            global_step += 1
-
-        avg_loss = running_loss / len(train_loader)
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch}, Train Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
-
-        # === Validation ===
-        model.eval()
-        correct, total = 0, 0
-        val_loss = 0.0
-        with torch.no_grad():
-            for images, labels in val_loader:
+    with logger:
+        for epoch in range(1, args.epochs + 1):
+            epoch_started = time.perf_counter()
+            model.train()
+            running_loss = 0.0
+            for i, (images, labels) in enumerate(tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")):
                 images, labels = images.to(device), labels.to(device)
+
+                # === Optional Teleportation ===
+                if (args.n_teleport > 0) and tele_scheduler[i] and epoch in args.tele_epoch_array:
+                    try_teleportation(
+                        vit_model=model,
+                        criterion=lambda logits, target: criterion(logits, target),
+                        samples=images,
+                        targets=labels,
+                        args=args,
+                        high=args.tele_high,
+                        low=args.tele_low,
+                        sign=args.tele_sign,
+                    )
+
                 outputs = model(pixel_values=images).logits
                 loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                preds = outputs.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-        avg_val_acc = correct / total
-        avg_val_loss = val_loss / len(val_loader)
-        print(f"Epoch {epoch}, Val Acc: {avg_val_acc * 100:.2f}%, Val Loss: {avg_val_loss:.4f}")
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                running_loss += loss.item()
+                global_step += 1
 
-        # Save last checkpoint
-        last_ckpt_path = os.path.join(save_dir, "last.pt")
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch,
-            "loss": avg_loss,
-            "val_acc": avg_val_acc,
-            "lr": current_lr,
-        }
-        torch.save(checkpoint, last_ckpt_path)
+            train_time_seconds = time.perf_counter() - epoch_started
+            avg_loss = running_loss / len(train_loader)
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"Epoch {epoch}, Train Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
 
-        # Save best checkpoint if improved
-        if avg_val_acc > best_acc:
-            best_acc = avg_val_acc
-            best_ckpt_path = os.path.join(save_dir, "best.pt")
-            torch.save(checkpoint, best_ckpt_path)
+            # === Validation ===
+            validation_started = time.perf_counter()
+            model.eval()
+            correct, total = 0, 0
+            val_loss = 0.0
+            with torch.no_grad():
+                for images, labels in val_loader:
+                    images, labels = images.to(device), labels.to(device)
+                    outputs = model(pixel_values=images).logits
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    preds = outputs.argmax(dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
+            validation_time_seconds = time.perf_counter() - validation_started
+            avg_val_acc = correct / total
+            avg_val_loss = val_loss / len(val_loader)
+            print(f"Epoch {epoch}, Val Acc: {avg_val_acc * 100:.2f}%, Val Loss: {avg_val_loss:.4f}")
 
-        # Step the LR scheduler
-        scheduler.step()
+            # Save last checkpoint
+            last_ckpt_path = os.path.join(save_dir, "last.pt")
+            checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
+                "loss": avg_loss,
+                "val_acc": avg_val_acc,
+                "lr": current_lr,
+            }
+            torch.save(checkpoint, last_ckpt_path)
+
+            # Save best checkpoint if improved
+            if avg_val_acc > best_acc:
+                best_acc = avg_val_acc
+                best_epoch = epoch
+                best_ckpt_path = os.path.join(save_dir, "best.pt")
+                torch.save(checkpoint, best_ckpt_path)
+
+            # Step the LR scheduler
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_val_acc)
+            elif scheduler is not None:
+                scheduler.step()
+
+            epoch_time_seconds = time.perf_counter() - epoch_started
+            logger.log_epoch(
+                {
+                    "epoch": epoch,
+                    "train_loss": avg_loss,
+                    "val_loss": avg_val_loss,
+                    "val_acc": avg_val_acc,
+                    "lr": current_lr,
+                    "next_lr": optimizer.param_groups[0]["lr"],
+                    "train_time_seconds": round(train_time_seconds, 6),
+                    "validation_time_seconds": round(validation_time_seconds, 6),
+                    "epoch_time_seconds": round(epoch_time_seconds, 6),
+                    "global_step": global_step,
+                },
+                best_val_acc=best_acc,
+                best_epoch=best_epoch,
+            )
+    print(f"Training log: {logger.log_path}")
 
 if __name__ == "__main__":
     main()
