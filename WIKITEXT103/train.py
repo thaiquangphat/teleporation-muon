@@ -4,6 +4,7 @@ import math
 import copy
 import os, sys
 import itertools
+import platform
 from datetime import datetime
 import wandb
 import torch
@@ -17,6 +18,8 @@ from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
 from teleport import try_teleportation, generate_tele_scheduler, calculate_grad_L2
+from muon import create_muon_optimizer
+from logger import TrainingLogger
 print(f'torch version: {torch.__version__}')
 parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model')
 parser.add_argument('--data', type=str, default='../data/wikitext-103',help='location of the data corpus')
@@ -35,9 +38,10 @@ parser.add_argument('--init_range', type=float, default=0.1,help='parameters ini
 parser.add_argument('--emb_init_range', type=float, default=0.01,help='parameters initialized by U(-init_range, init_range)')
 parser.add_argument('--init_std', type=float, default=0.02,help='parameters initialized by N(0, init_std)')
 parser.add_argument('--proj_init_std', type=float, default=0.01,help='parameters initialized by N(0, init_std)')
-parser.add_argument('--optim', default='adam', type=str,choices=['adam', 'sgd', 'adagrad'],help='optimizer to use.')
+parser.add_argument('--optim', default='adam', type=str,choices=['adam', 'sgd', 'adagrad', 'muon'],help='optimizer to use.')
 parser.add_argument('--lr', type=float, default=0.00025,help='initial learning rate (0.00025|5 for adam|sgd)')
 parser.add_argument('--mom', type=float, default=0.9,help='momentum for sgd')
+parser.add_argument('--weight_decay', type=float, default=0.0,help='weight decay used by Muon.')
 parser.add_argument('--scheduler', default='cosine', type=str,choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'],help='lr scheduler to use.')
 parser.add_argument('--warmup_step', type=int, default=0,help='upper epoch limit')
 parser.add_argument('--decay_rate', type=float, default=0.5,help='decay factor when ReduceLROnPlateau is used')
@@ -110,19 +114,27 @@ parser.add_argument('--tele-sign', type=int, default=0, help='Sign')
 parser.add_argument('--tele-layer', type=str, default="all", choices=["all", "first", "last"])
 args = parser.parse_args()
 
+if args.optim == 'muon' and args.sample_softmax > 0:
+    parser.error('--optim muon cannot be combined with --sample_softmax')
+
+run_name = (
+    f"lr{args.lr}-{args.optim}-attn{args.attn_type}"
+    f"-L{args.n_layer}-d{args.d_model}-h{args.n_head}"
+    f"-batch{args.batch_size}-tgt{args.tgt_len}-steps{args.max_step}"
+    f"-teleport{args.n_teleport}-tele-batch{args.tele_batch}"
+    f"-att{args.tele_att}-mlp{args.tele_mlp}-tele-opt{args.tele_opt}"
+    f"-high{args.tele_high}-low{args.tele_low}"
+    f"-start{args.tele_start}-limit{args.tele_limit}"
+    f"-sign{args.tele_sign}-seed{args.seed}"
+)
+args.work_dir = os.path.join(args.work_dir, run_name)
+
 if args.use_wandb:  # configure wandb.
     use_wandb = True
     wandb.init(project=args.wandb_project,entity=args.wandb_entity,group=args.wandb_group,save_code=True)
-    run_name = (
-        f"lr{args.lr}-{args.optim}-attn{args.attn_type}-teleport{args.n_teleport}-att{args.tele_att}-mlp{args.tele_mlp}"
-        f"-opt{args.tele_opt}-high{args.tele_high}-low{args.tele_low}-start{args.tele_start}-limit{args.tele_limit}-sign{args.tele_sign}-seed{args.seed}"
-    )
     wandb.run.name = run_name
-    args.work_dir = os.path.join(args.work_dir, run_name)
-    print(args.work_dir)
-    os.makedirs(args.work_dir, exist_ok=True)
     config = wandb.config
-    config.host = os.uname()[1]  # host node name
+    config.host = platform.node()
     config.data=args.data
     config.dataset=args.dataset
     config.n_layer=args.n_layer
@@ -398,6 +410,13 @@ elif args.optim.lower() == 'adam':
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
 elif args.optim.lower() == 'adagrad':
     optimizer = optim.Adagrad(model.parameters(), lr=args.lr)
+elif args.optim.lower() == 'muon':
+    optimizer = create_muon_optimizer(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        momentum=args.mom,
+    )
 
 #### scheduler
 if args.scheduler == 'cosine':
@@ -457,6 +476,28 @@ tele_scheduler = generate_tele_scheduler(
     tele_batch=args.tele_batch,number_of_batch=args.eval_interval, tele_opt=args.tele_opt, tele_cons=args.tele_cons,
 )
 print(tele_scheduler)
+gpu_name = torch.cuda.get_device_name(device) if device.type == 'cuda' else None
+training_logger = TrainingLogger(
+    save_dir=args.work_dir,
+    run_name=run_name,
+    config=vars(args),
+    environment={
+        "host": platform.node(),
+        "device": str(device),
+        "gpu_name": gpu_name,
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+    },
+    dataset={
+        "name": args.dataset,
+        "data_dir": args.data,
+        "vocabulary_size": ntokens,
+    },
+    model={
+        "parameter_count": args.n_all_param,
+        "non_embedding_parameter_count": args.n_nonemb_param,
+    },
+)
 ###############################################################################
 # Training code
 # ##############################################################################
@@ -485,11 +526,13 @@ def evaluate(eval_iter):
     model.train()
     return total_loss / total_len
 def train():
-    global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
+    global train_step, train_loss, best_val_loss, best_step, eval_start_time, log_start_time
     model.train()  # Turn on training mode which enables dropout.
     mems = tuple()
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
     grad = 0.0
+    eval_train_loss = 0.0
+    eval_train_batches = 0
     for batch, (data, target, seq_len) in tqdm(enumerate(train_iter)):
         model.zero_grad()
         if args.n_teleport and tele_scheduler[train_step%args.eval_interval] and (epoch-1)%args.tele_epoch == 0 and args.tele_start <= train_step < args.tele_limit:
@@ -503,7 +546,10 @@ def train():
         loss.backward()
         grad_tmp = calculate_grad_L2(model)
         grad += grad_tmp
-        train_loss += loss.float().item()
+        batch_loss = loss.float().item()
+        train_loss += batch_loss
+        eval_train_loss += batch_loss
+        eval_train_batches += 1
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
         optimizer.step()
         if args.sample_softmax > 0: optimizer_sparse.step()
@@ -513,7 +559,8 @@ def train():
             # linear warmup stage
             if train_step < args.warmup_step:
                 curr_lr = args.lr * train_step / args.warmup_step
-                optimizer.param_groups[0]['lr'] = curr_lr
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = curr_lr
                 if args.sample_softmax > 0: optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
             else:
                 if args.scheduler == 'cosine':
@@ -535,10 +582,25 @@ def train():
                 log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
                 if use_wandb: wandb.log({"train_loss":cur_loss,"ppl": math.exp(cur_loss),"l2_gradient_step": grad_tmp},step = train_step)
             logging(log_str)
+            train_metrics = {
+                "epoch": epoch,
+                "step": train_step,
+                "train_loss": cur_loss,
+                "lr": optimizer.param_groups[0]['lr'],
+                "milliseconds_per_batch": elapsed * 1000 / args.log_interval,
+                "gradient_l2": grad_tmp,
+            }
+            if args.dataset in ['enwik8', 'text8']:
+                train_metrics["train_bpc"] = cur_loss / math.log(2)
+            else:
+                train_metrics["train_ppl"] = math.exp(cur_loss)
+            training_logger.log_training(train_metrics)
             train_loss = 0
             log_start_time = time.time()
         if train_step % args.eval_interval == 0:
-            grad /= args.eval_interval
+            avg_grad = grad / args.eval_interval
+            grad = 0.0
+            current_lr = optimizer.param_groups[0]['lr']
             val_loss = evaluate(va_iter)
             logging('-' * 100)
             log_str = '| Eval {:3d} at step {:>8d} | time: {:5.2f}s ' \
@@ -547,25 +609,48 @@ def train():
                 (time.time() - eval_start_time), val_loss)
             if args.dataset in ['enwik8', 'text8']:
                 log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
-                if use_wandb: wandb.log({"valid_loss":val_loss,"valid_bpc": val_loss / math.log(2), "l2_gradient": grad},step = train_step)
+                if use_wandb: wandb.log({"valid_loss":val_loss,"valid_bpc": val_loss / math.log(2), "l2_gradient": avg_grad},step = train_step)
             else:
                 log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
-                if use_wandb: wandb.log({"valid_loss":val_loss,"valid_ppl": math.exp(val_loss),"l2_gradient": grad},step = train_step)
+                if use_wandb: wandb.log({"valid_loss":val_loss,"valid_ppl": math.exp(val_loss),"l2_gradient": avg_grad},step = train_step)
             logging(log_str)
             logging('-' * 100)
             # Save the model if the validation loss is the best so far.
-            if not best_val_loss or val_loss < best_val_loss:
+            if best_val_loss is None or val_loss < best_val_loss:
                 if not args.debug:
                     with open(os.path.join(args.work_dir,'model.pt'), 'wb') as f:
                         torch.save(model, f)
                     with open(os.path.join(args.work_dir,'optimizer.pt'), 'wb') as f:
                         torch.save(optimizer.state_dict(), f)
                 best_val_loss = val_loss
+                best_step = train_step
             # dev-performance based learning rate annealing
             if args.scheduler == 'dev_perf':
                 scheduler.step(val_loss)
                 if args.sample_softmax > 0:
                     scheduler_sparse.step(val_loss)
+            eval_metrics = {
+                "epoch": epoch,
+                "step": train_step,
+                "train_loss": (
+                    eval_train_loss / eval_train_batches
+                    if eval_train_batches else None
+                ),
+                "valid_loss": val_loss,
+                "lr": current_lr,
+                "gradient_l2": avg_grad,
+            }
+            if args.dataset in ['enwik8', 'text8']:
+                eval_metrics["valid_bpc"] = val_loss / math.log(2)
+            else:
+                eval_metrics["valid_ppl"] = math.exp(val_loss)
+            training_logger.log_evaluation(
+                eval_metrics,
+                best_val_loss=best_val_loss,
+                best_step=best_step,
+            )
+            eval_train_loss = 0.0
+            eval_train_batches = 0
             eval_start_time = time.time()
         if train_step == args.max_step:
             break
@@ -573,32 +658,40 @@ def train():
 train_step = 0
 train_loss = 0
 best_val_loss = None
+best_step = None
 log_start_time = time.time()
 eval_start_time = time.time()
-print(datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
-# At any point you can hit Ctrl + C to break out of training early.
-try:
-    for epoch in itertools.count(start=1):
-        train()
-        print(f'end of epoch {epoch}: {datetime.now().strftime("%Y/%m/%d %H:%M:%S")}')
-        if train_step == args.max_step:
-            logging('-' * 100)
-            logging('End of training')
-            break
-except KeyboardInterrupt:
-    logging('-' * 100)
-    logging('Exiting from training early')
-if use_wandb: wandb.finish()
-# Load the best saved model.
-with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
-    model = torch.load(f)
-para_model = model.to(device)
-# Run on test data.
-logging('Evaluation...')
-test_loss = evaluate(te_iter)
-logging('=' * 100)
-if args.dataset in ['enwik8', 'text8']:
-    logging('| End of training | test loss {:5.2f} | test bpc {:9.5f}'.format(test_loss, test_loss / math.log(2)))
-else:
-    logging('| End of training | test loss {:5.2f} | test ppl {:9.3f}'.format(test_loss, math.exp(test_loss)))
-logging('=' * 100)
+with training_logger:
+    print(datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
+    # At any point you can hit Ctrl + C to break out of training early.
+    try:
+        for epoch in itertools.count(start=1):
+            train()
+            print(f'end of epoch {epoch}: {datetime.now().strftime("%Y/%m/%d %H:%M:%S")}')
+            if train_step == args.max_step:
+                logging('-' * 100)
+                logging('End of training')
+                break
+    except KeyboardInterrupt:
+        logging('-' * 100)
+        logging('Exiting from training early')
+        training_logger.mark_interrupted()
+    if use_wandb: wandb.finish()
+    # Load the best saved model.
+    with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
+        model = torch.load(f, weights_only=False)
+    para_model = model.to(device)
+    # Run on test data.
+    logging('Evaluation...')
+    test_loss = evaluate(te_iter)
+    logging('=' * 100)
+    test_metrics = {"test_loss": test_loss}
+    if args.dataset in ['enwik8', 'text8']:
+        test_metrics["test_bpc"] = test_loss / math.log(2)
+        logging('| End of training | test loss {:5.2f} | test bpc {:9.5f}'.format(test_loss, test_loss / math.log(2)))
+    else:
+        test_metrics["test_ppl"] = math.exp(test_loss)
+        logging('| End of training | test loss {:5.2f} | test ppl {:9.3f}'.format(test_loss, math.exp(test_loss)))
+    training_logger.log_test(test_metrics)
+    logging('=' * 100)
+print(f"Training log: {training_logger.log_path}")
