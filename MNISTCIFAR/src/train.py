@@ -113,7 +113,7 @@ def main():
         optimizer = SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
     elif args.opt == "muon":
         optimizer = torch.optim.Muon(
-            model,
+            model.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
             momentum=args.momentum,
