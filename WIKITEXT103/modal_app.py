@@ -28,14 +28,14 @@ wkt103_weights = modal.Volume.from_name("wt103-weights")
 
 @app.function(
     image=image,
-    gpu="A100",
-    cpu=12,
-    memory=32 * 1024,
+    gpu="T4",
+    cpu=4,
+    memory=16 * 1024,
     volumes={
         "/data/wt103": wkt103_volume,
         "/data/weights": wkt103_weights,
     },
-    timeout=60 * 60 * 12,
+    timeout=60 * 60 * 24,
 )
 def run_test():
 

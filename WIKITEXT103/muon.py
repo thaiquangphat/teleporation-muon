@@ -146,7 +146,7 @@ def create_muon_optimizer(model, lr, weight_decay, momentum=0.95):
             {
                 "params": adam_parameters,
                 "use_muon": False,
-                "lr": lr,
+                "lr": 3e-4,
                 "betas": (0.9, 0.95),
                 "eps": 1e-10,
                 "weight_decay": weight_decay,

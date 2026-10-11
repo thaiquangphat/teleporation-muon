@@ -39,8 +39,8 @@ parser.add_argument('--emb_init_range', type=float, default=0.01,help='parameter
 parser.add_argument('--init_std', type=float, default=0.02,help='parameters initialized by N(0, init_std)')
 parser.add_argument('--proj_init_std', type=float, default=0.01,help='parameters initialized by N(0, init_std)')
 parser.add_argument('--optim', default='adam', type=str,choices=['adam', 'sgd', 'adagrad', 'muon'],help='optimizer to use.')
-parser.add_argument('--lr', type=float, default=0.00025,help='initial learning rate (0.00025|5 for adam|sgd)')
-parser.add_argument('--mom', type=float, default=0.9,help='momentum for sgd')
+parser.add_argument('--lr', type=float, default=None,help='initial learning rate (defaults to 0.005 for Muon, 0.00025 otherwise)')
+parser.add_argument('--mom', type=float, default=None,help='momentum (defaults to 0.95 for Muon, 0.9 otherwise)')
 parser.add_argument('--weight_decay', type=float, default=0.0,help='weight decay used by Muon.')
 parser.add_argument('--scheduler', default='cosine', type=str,choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'],help='lr scheduler to use.')
 parser.add_argument('--warmup_step', type=int, default=0,help='upper epoch limit')
@@ -113,6 +113,11 @@ parser.add_argument('--tele-cons', type=int, default=16, help='Consecutive')
 parser.add_argument('--tele-sign', type=int, default=0, help='Sign')
 parser.add_argument('--tele-layer', type=str, default="all", choices=["all", "first", "last"])
 args = parser.parse_args()
+
+if args.lr is None:
+    args.lr = 0.005 if args.optim.lower() == 'muon' else 0.00025
+if args.mom is None:
+    args.mom = 0.95 if args.optim.lower() == 'muon' else 0.9
 
 if args.optim == 'muon' and args.sample_softmax > 0:
     parser.error('--optim muon cannot be combined with --sample_softmax')
@@ -475,7 +480,7 @@ logging('#non emb params = {}'.format(args.n_nonemb_param))
 tele_scheduler = generate_tele_scheduler(
     tele_batch=args.tele_batch,number_of_batch=args.eval_interval, tele_opt=args.tele_opt, tele_cons=args.tele_cons,
 )
-print(tele_scheduler)
+# print(tele_scheduler)
 gpu_name = torch.cuda.get_device_name(device) if device.type == 'cuda' else None
 training_logger = TrainingLogger(
     save_dir=args.work_dir,
@@ -558,10 +563,15 @@ def train():
         if args.scheduler in ['cosine', 'constant', 'dev_perf']:
             # linear warmup stage
             if train_step < args.warmup_step:
-                curr_lr = args.lr * train_step / args.warmup_step
+                warmup_ratio = train_step / args.warmup_step
+
                 for param_group in optimizer.param_groups:
-                    param_group['lr'] = curr_lr
-                if args.sample_softmax > 0: optimizer_sparse.param_groups[0]['lr'] = curr_lr * 2
+                    if param_group.get("use_muon", False):
+                        param_group["lr"] = args.lr * warmup_ratio
+                    elif args.optim.lower() == "muon":
+                        param_group["lr"] = 3e-4 * warmup_ratio
+                    else:
+                        param_group["lr"] = args.lr * warmup_ratio
             else:
                 if args.scheduler == 'cosine':
                     scheduler.step(train_step)

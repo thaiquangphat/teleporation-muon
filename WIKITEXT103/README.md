@@ -17,11 +17,13 @@ bash scripts.sh
 
 ## Train on Modal
 Create a Modal secret named `kaggle` with the keys `username` and `key` for
-Kaggle dataset access. From this directory, start the default 100,000-step
-Muon run with:
+Kaggle dataset access. From this directory, start the Muon run configured in `script_test.sh` (36,000
+steps) with:
 ```bash
 modal run modal_app.py
 ```
+Muon defaults to a learning rate of `0.005` and momentum of `0.95`; pass
+`--lr` or `--mom` to override them.
 To run a shorter smoke test, set a smaller step count:
 ```bash
 modal run modal_app.py --max-step 10
