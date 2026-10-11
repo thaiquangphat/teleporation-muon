@@ -3,7 +3,7 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
 SEEDS="${SEEDS:-42 123 2024}"
-EPOCHS="${EPOCHS:-5}"
+EPOCHS="${EPOCHS:-50}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 SAVE_DIR="${SAVE_DIR:-./checkpoints}"
