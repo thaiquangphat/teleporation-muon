@@ -20,7 +20,7 @@ for dataset in MNIST CIFAR10; do
             if [[ "$mode" == "baseline" ]]; then
                 teleport_count=0
             else
-                teleport_count=8
+                teleport_count=16
             fi
 
             for seed in "${seed_array[@]}"; do
@@ -38,13 +38,17 @@ for dataset in MNIST CIFAR10; do
                     --n-teleport "$teleport_count" \
                     --tele-batch 32 \
                     --tele-opt 1 \
-                    --tele-high 1.1 \
-                    --tele-low 0.9 \
+                    --tele-high 1.65 \
+                    --tele-low 0.35 \
                     --tele-cons 16 \
                     --tele-layer all
             done
         done
     done
 done
+
+echo "Running analyze."
+
+python analyze_results.py
 
 echo "All experiments completed."
