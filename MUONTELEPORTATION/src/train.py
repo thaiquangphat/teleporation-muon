@@ -11,11 +11,11 @@ from torch import nn
 from torch.optim import AdamW, SGD
 from tqdm import tqdm
 
-from src.datamodule import get_dataset
-from src.logger import TrainingLogger
-from src.model import SimpleMLP
-from src.muon import create_muon_optimizer
-from src.teleport import apply_teleportation_to_real_model, try_teleportation
+from datamodule import get_dataset
+from logger import TrainingLogger
+from model import SimpleMLP
+from muon import create_muon_optimizer
+from teleport import apply_teleportation_to_real_model, try_teleportation
 
 
 def list_of_ints(value: str):
