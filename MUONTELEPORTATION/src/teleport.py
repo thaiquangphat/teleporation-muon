@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 from torch import nn
-
+from muon import create_muon_optimizer
 
 @dataclass
 class CandidateResult:
@@ -109,8 +109,6 @@ def _make_optimizer_for_model(model: nn.Module, optimizer: torch.optim.Optimizer
             weight_decay=optimizer.param_groups[0].get("weight_decay", 0.0),
         )
     if optimizer.__class__.__name__.endswith("MuonWithAuxAdam") or "SingleDeviceMuonWithAuxAdam" in optimizer.__class__.__name__:
-        from src.muon import create_muon_optimizer
-
         return create_muon_optimizer(
             model,
             lr=optimizer.param_groups[0]["lr"],
