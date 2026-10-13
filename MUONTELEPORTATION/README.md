@@ -54,3 +54,5 @@ bash script_test.sh
 ```
 
 Each run writes `log.json`, `last.pt`, and `best.pt` under `checkpoints/<run_name>/`. Teleport decisions are stored in `log.json` under `telemetry`.
+
+Run `bash scripts.sh` to execute each configured experiment with seeds 1, 2, and 3. After all runs complete, it writes plots of the per-epoch metric means and mean best validation accuracy to `plots/`.

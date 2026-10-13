@@ -1,6 +1,8 @@
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
+from statistics import mean
 
 import matplotlib
 
@@ -23,6 +25,9 @@ def load_runs(results_dir: Path) -> list[dict]:
         if not dataset:
             print(f"Skipping log without dataset metadata: {log_path}")
             continue
+        if log.get("status") not in (None, "completed"):
+            print(f"Skipping incomplete run log: {log_path}")
+            continue
 
         method = config.get("tele_method", "unknown")
         state_mode = config.get("tele_state_mode", "unknown")
@@ -34,11 +39,65 @@ def load_runs(results_dir: Path) -> list[dict]:
                 "method": method,
                 "state_mode": state_mode,
                 "label": f"{optimizer} / {method} / {state_mode}",
+                "config": config,
+                "seed": config.get("seed"),
                 "epochs": epochs,
                 "best_val_acc": log.get("best_val_acc"),
             }
         )
     return runs
+
+
+def average_runs(runs: list[dict]) -> list[dict]:
+    grouped_runs: dict[str, list[dict]] = defaultdict(list)
+    for run in runs:
+        config = {key: value for key, value in run["config"].items() if key != "seed"}
+        group_key = json.dumps(config, sort_keys=True)
+        grouped_runs[group_key].append(run)
+
+    averages = []
+    for group in grouped_runs.values():
+        seeds = [run["seed"] for run in group]
+        if len(set(seeds)) != len(seeds):
+            raise RuntimeError(f"Duplicate seed logs found for experiment: {group[0]['label']}")
+
+        epoch_numbers = [
+            {record["epoch"] for record in run["epochs"]}
+            for run in group
+        ]
+        if any(numbers != epoch_numbers[0] for numbers in epoch_numbers[1:]):
+            raise RuntimeError(
+                f"Epochs differ between seeds for experiment: {group[0]['label']}"
+            )
+
+        averaged_epochs = []
+        for epoch in sorted(epoch_numbers[0]):
+            records = [
+                next(record for record in run["epochs"] if record["epoch"] == epoch)
+                for run in group
+            ]
+            averaged_epochs.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": mean(record["train_loss"] for record in records),
+                    "val_loss": mean(record["val_loss"] for record in records),
+                    "val_acc": mean(record["val_acc"] for record in records),
+                }
+            )
+
+        best_scores = [
+            run["best_val_acc"]
+            if run["best_val_acc"] is not None
+            else max(record["val_acc"] for record in run["epochs"])
+            for run in group
+        ]
+        average = dict(group[0])
+        average["epochs"] = averaged_epochs
+        average["best_val_acc"] = mean(best_scores)
+        average["seed_count"] = len(group)
+        average["label"] = f'{group[0]["label"]} (mean of {len(group)} seeds)'
+        averages.append(average)
+    return averages
 
 
 def plot_dataset_metrics(dataset: str, runs: list[dict], output_dir: Path) -> None:
@@ -104,13 +163,13 @@ def plot_best_accuracy(runs: list[dict], output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot validation accuracy and loss from MUONTELEPORTATION run logs."
+        description="Plot mean validation accuracy and loss from MUONTELEPORTATION run logs."
     )
     parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
 
-    runs = load_runs(args.results_dir)
+    runs = average_runs(load_runs(args.results_dir))
     if not runs:
         raise RuntimeError(f"No completed epoch logs found under {args.results_dir}")
 
@@ -122,7 +181,10 @@ def main() -> None:
             args.output_dir,
         )
     plot_best_accuracy(runs, args.output_dir)
-    print(f"Plotted {len(runs)} runs into {args.output_dir}")
+    print(
+        f"Plotted {len(runs)} experiment means from "
+        f"{sum(run['seed_count'] for run in runs)} seed runs into {args.output_dir}"
+    )
 
 
 if __name__ == "__main__":
