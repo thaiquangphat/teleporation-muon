@@ -509,7 +509,19 @@ def virtual_optimizer_step(
 
 
 def _candidate_sort_key(result: Dict[str, Any]) -> Tuple[float, int]:
-    return (float(result["post_step_loss"]), 0 if result["identity"] else 1)
+    return (float(result["alignment"]), -1 if result["identity"] else 0)
+
+
+def _resolve_alignment_shortlist(args: Any, non_identity_count: int) -> int:
+    raw_shortlist = getattr(args, "tele_align_shortlist", None)
+    if raw_shortlist is None:
+        raw_shortlist = min(3, max(1, non_identity_count))
+    shortlist = int(raw_shortlist)
+    if shortlist <= 0:
+        raise ValueError("--tele-align-shortlist must be positive.")
+    if non_identity_count == 0:
+        return 0
+    return min(shortlist, non_identity_count)
 
 
 def try_muon_alignment_teleportation(
@@ -527,91 +539,133 @@ def try_muon_alignment_teleportation(
     rope = args.position_embedding == "rope"
     query = qk_linear_modules(model, args.tele_layer)[0][0]
     dim = query.out_features
-    candidates = candidate_qk_scales(
-        dim=dim,
-        low=low,
-        high=high,
-        count=args.tele_candidates,
-        seed=args.seed + step_index,
-        rope=rope,
-    )
+    if args.tele_candidates < 2:
+        raise ValueError("muon_alignment requires at least one non-identity candidate; --tele-candidates must be >= 2.")
 
     was_training = model.training
     model.train()
-    regular_model, regular_optimizer = clone_model_and_optimizer(model, optimizer)
-    regular_loss = virtual_optimizer_step(regular_model, regular_optimizer, batch, criterion)
-
-    results: List[Dict[str, Any]] = []
-    for index, scale in enumerate(candidates):
-        align_model, align_optimizer = clone_model_and_optimizer(model, optimizer)
-        apply_qk_diagonal_transform(align_model, scale, args.tele_layer, rope, low, high)
-        alignment = compute_qk_muon_alignment(align_model, align_optimizer, batch, criterion, args.tele_layer)
-
-        step_model, step_optimizer = clone_model_and_optimizer(model, optimizer)
-        apply_qk_diagonal_transform(step_model, scale, args.tele_layer, rope, low, high)
-        reset_qk_optimizer_state(step_model, step_optimizer, args.tele_layer)
-        post_loss = virtual_optimizer_step(step_model, step_optimizer, batch, criterion)
-        results.append(
-            {
-                "candidate_index": index,
-                "identity": index == 0,
-                "scale": scale.detach().cpu().tolist(),
-                "scale_min": float(scale.min()),
-                "scale_max": float(scale.max()),
-                "alignment": float(alignment),
-                "post_step_loss": float(post_loss),
-            }
+    try:
+        candidates = candidate_qk_scales(
+            dim=dim,
+            low=low,
+            high=high,
+            count=args.tele_candidates,
+            seed=args.seed + step_index,
+            rope=rope,
         )
+        shortlist_size = _resolve_alignment_shortlist(args, max(0, args.tele_candidates - 1))
+        shortlisted_indices = set()
 
-    restore_rng_state(rng_state)
-    model.train(was_training)
-    assert_live_state_unchanged(model, optimizer, live_snapshot)
+        regular_model, regular_optimizer = clone_model_and_optimizer(model, optimizer)
+        restore_rng_state(rng_state)
+        regular_loss = virtual_optimizer_step(regular_model, regular_optimizer, batch, criterion)
 
-    identity_result = next(result for result in results if result["identity"])
-    selected = min(results, key=_candidate_sort_key)
-    epsilon = float(args.tele_accept_tol)
-    accepted = False
-    reason = "rejected"
-    if selected["identity"]:
-        reason = "reset_only"
-    elif selected["post_step_loss"] < regular_loss - epsilon:
-        accepted = True
-        reason = "accepted_better_than_regular_muon"
-    else:
-        reason = "rejected_did_not_beat_regular_muon"
+        results: List[Dict[str, Any]] = []
+        for index, scale in enumerate(candidates):
+            identity = index == 0
+            align_model, align_optimizer = clone_model_and_optimizer(model, optimizer)
+            restore_rng_state(rng_state)
+            apply_qk_diagonal_transform(align_model, scale, args.tele_layer, rope, low, high)
+            alignment = compute_qk_muon_alignment(align_model, align_optimizer, batch, criterion, args.tele_layer)
+            results.append(
+                {
+                    "candidate_index": index,
+                    "identity": identity,
+                    "scale": scale.detach().cpu().tolist(),
+                    "scale_min": float(scale.min()),
+                    "scale_max": float(scale.max()),
+                    "alignment": float(alignment),
+                    "alignment_rank": None,
+                    "virtual_loss_evaluated": False,
+                    "post_step_loss": None,
+                    "searched": False,
+                }
+            )
 
-    if accepted:
-        apply_qk_diagonal_transform(
-            model,
-            torch.tensor(selected["scale"], dtype=torch.float32),
-            args.tele_layer,
-            rope,
-            low,
-            high,
-        )
-        reset_qk_optimizer_state(model, optimizer, args.tele_layer)
+        ranked = sorted(results, key=lambda item: float(item["alignment"]), reverse=True)
+        for rank, item in enumerate(ranked, start=1):
+            item["alignment_rank"] = rank
+        shortlisted = [item for item in ranked if not item["identity"]][:shortlist_size]
+        for item in shortlisted:
+            shortlisted_indices.add(item["candidate_index"])
 
-    telemetry = {
-        "method": "muon_alignment",
-        "accepted": accepted,
-        "reason": reason,
-        "step": step_index,
-        "search_time_seconds": round(time.perf_counter() - started, 6),
-        "regular_muon_post_step_loss": regular_loss,
-        "identity_reset_loss": identity_result["post_step_loss"],
-        "identity_alignment": identity_result["alignment"],
-        "selected_alignment": selected["alignment"],
-        "selected_post_step_loss": selected["post_step_loss"],
-        "selected_identity": selected["identity"],
-        "selected_scale": selected["scale"],
-        "scale_min": selected["scale_min"],
-        "scale_max": selected["scale_max"],
-        "state_reset": accepted,
-        "tele_layer": args.tele_layer,
-        "results": results,
-    }
-    return accepted, telemetry
+        identity_result = next(item for item in results if item["identity"])
+        for check in [identity_result, *shortlisted]:
+            if check["candidate_index"] in shortlisted_indices or check["identity"]:
+                restore_rng_state(rng_state)
+                step_model, step_optimizer = clone_model_and_optimizer(model, optimizer)
+                restore_rng_state(rng_state)
+                apply_qk_diagonal_transform(step_model, torch.tensor(check["scale"], dtype=torch.float32), args.tele_layer, rope, low, high)
+                reset_qk_optimizer_state(step_model, step_optimizer, args.tele_layer)
+                check["post_step_loss"] = float(virtual_optimizer_step(step_model, step_optimizer, batch, criterion))
+                check["virtual_loss_evaluated"] = True
+                check["searched"] = True
 
+        restore_rng_state(rng_state)
+        assert_live_state_unchanged(model, optimizer, live_snapshot)
+
+        non_identity_results = [item for item in results if not item["identity"] and item["virtual_loss_evaluated"]]
+        best_non_identity = min(non_identity_results, key=lambda item: float(item["post_step_loss"])) if non_identity_results else None
+        epsilon = float(args.tele_accept_tol)
+
+        accepted = False
+        reason = "rejected"
+        if best_non_identity is not None and best_non_identity["post_step_loss"] < regular_loss - epsilon:
+            accepted = True
+            reason = "accepted_better_than_regular_muon"
+        elif identity_result["virtual_loss_evaluated"] and identity_result["post_step_loss"] < regular_loss - epsilon:
+            reason = "reset_only"
+        else:
+            reason = "rejected_did_not_beat_regular_muon"
+
+        if accepted and best_non_identity is not None:
+            apply_qk_diagonal_transform(
+                model,
+                torch.tensor(best_non_identity["scale"], dtype=torch.float32),
+                args.tele_layer,
+                rope,
+                low,
+                high,
+            )
+            reset_qk_optimizer_state(model, optimizer, args.tele_layer)
+
+        if accepted and best_non_identity is not None:
+            selected = best_non_identity
+        else:
+            selected = best_non_identity if best_non_identity is not None else identity_result
+
+        post_loss_gain = float(regular_loss) - float(selected["post_step_loss"]) if selected["post_step_loss"] is not None else 0.0
+        alignment_gain = float(selected["alignment"]) - float(identity_result["alignment"]) if identity_result is not None else 0.0
+
+        telemetry = {
+            "method": "muon_alignment",
+            "accepted": accepted,
+            "reason": reason,
+            "step": step_index,
+            "search_time_seconds": round(time.perf_counter() - started, 6),
+            "regular_muon_post_step_loss": float(regular_loss),
+            "identity_reset_loss": float(identity_result["post_step_loss"]),
+            "identity_alignment": float(identity_result["alignment"]),
+            "best_non_identity_candidate_loss": float(best_non_identity["post_step_loss"]) if best_non_identity is not None else None,
+            "selected_alignment": float(selected["alignment"]),
+            "selected_post_step_loss": float(selected["post_step_loss"]) if selected["post_step_loss"] is not None else None,
+            "selected_identity": bool(selected["identity"]),
+            "selected_scale": selected["scale"],
+            "scale_min": selected["scale_min"],
+            "scale_max": selected["scale_max"],
+            "identity_rank": int(identity_result["alignment_rank"]),
+            "state_reset": accepted,
+            "tele_layer": args.tele_layer,
+            "alignment_gain": alignment_gain,
+            "post_loss_gain": post_loss_gain,
+            "shortlist_size": shortlist_size,
+            "results": results,
+        }
+        return accepted, telemetry
+    finally:
+        restore_rng_state(rng_state)
+        model.train(was_training)
+        assert_live_state_unchanged(model, optimizer, live_snapshot)
 
 def try_teleportation(
     model: nn.Module,
