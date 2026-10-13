@@ -1,3 +1,28 @@
+"""Single-device Muon optimizer adapted from Keller Jordan's Muon repository.
+
+Copyright (c) 2024 Keller Jordan
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
 import torch
 
 
@@ -35,7 +60,7 @@ def _adam_update(gradient, exp_avg, exp_avg_sq, step, betas, eps):
 
 
 class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
-    """Muon for matrix weights and Adam-like update for everything else."""
+    """Apply Muon to matrix weights and AdamW to other parameters."""
 
     def __init__(self, param_groups):
         for group in param_groups:
@@ -95,21 +120,22 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
 
 
 def create_muon_optimizer(model, lr, weight_decay, momentum=0.95):
-    """Use Muon for matrix weights and Adam-like update for scalars and biases."""
+    """Use Muon for transformer matrix weights and AdamW for the remaining weights."""
     muon_parameters = []
     adam_parameters = []
     adam_only_name_parts = ("embedding", "classifier", "pooler")
 
     for name, parameter in model.named_parameters():
         is_hidden_matrix = (
-            parameter.ndim >= 2 and not any(part in name.lower() for part in adam_only_name_parts)
+            parameter.ndim >= 2
+            and not any(part in name.lower() for part in adam_only_name_parts)
         )
         (muon_parameters if is_hidden_matrix else adam_parameters).append(parameter)
 
     if not muon_parameters:
         raise ValueError("Muon requires at least one eligible matrix parameter.")
     if not adam_parameters:
-        raise ValueError("Muon requires at least one parameter for its Adam group.")
+        raise ValueError("Muon requires at least one parameter for its AdamW group.")
 
     return SingleDeviceMuonWithAuxAdam(
         [

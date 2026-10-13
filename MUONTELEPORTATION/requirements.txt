@@ -1,5 +1,8 @@
 torch>=2.1.0
 torchvision>=0.16.0
- pytest>=8.0.0
- tqdm>=4.9.0
- matplotlib>=3.8.0
+transformers==4.56.1
+pytest>=8.0.0
+tqdm>=4.9.0
+matplotlib>=3.8.0
+numpy
+typing_extensions

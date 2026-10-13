@@ -1,21 +1,202 @@
 import copy
 import math
 import random
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
-from .muon import create_muon_optimizer
 
-@dataclass
-class CandidateResult:
-    scale: torch.Tensor
-    score: float
-    loss_before: float
-    loss_after: float | None = None
-    accepted: bool = False
-    method: str = ""
+from muon import _muon_update, create_muon_optimizer
+
+
+def calculate_grad_L2(net):
+    total_L2 = 0.0
+    for name, param in net.named_parameters():
+        if param.grad is not None:
+            total_L2 += param.grad.norm(2).item() ** 2
+    return total_L2 ** 0.5
+
+
+def generate_tele_scheduler(tele_batch, number_of_batch, tele_opt, tele_cons):
+    if tele_opt == 0:
+        tele_scheduler = [True] * tele_batch + [False] * (number_of_batch - tele_batch)
+        random.shuffle(tele_scheduler)
+    elif tele_opt == 1:
+        tele_scheduler = [False] * number_of_batch
+        count = 0
+        for i in range(0, (tele_batch + tele_cons - 1) // tele_cons):
+            for j in range(tele_cons):
+                if ((i * number_of_batch) // ((tele_batch + tele_cons - 1) // tele_cons)) + j < number_of_batch and count < tele_batch:
+                    tele_scheduler[((i * number_of_batch) // ((tele_batch + tele_cons - 1) // tele_cons)) + j] = True
+                    count += 1
+    return tele_scheduler
+
+
+def gen_inv_matrix(n_head, d_head, tele_high, tele_low, tele_sign):
+    size = d_head
+    dtype = torch.float32
+    M = torch.eye(size, dtype=dtype)
+    M *= torch.rand(size, dtype=dtype) * (tele_high - tele_low) + tele_low
+    if tele_sign == 1:
+        mask = torch.randint(0, 2, (size,), dtype=dtype) * 2 - 1
+        M[range(size), range(size)] *= mask
+    indices = torch.randperm(size)
+    M = M[indices, :]
+    indices = torch.randperm(size)
+    M = M[:, indices]
+    M_inv = torch.transpose(M, -1, -2)
+    M_inv = torch.where(M_inv != 0, 1.0 / M_inv, M_inv)
+    M = torch.block_diag(*[M] * n_head)
+    M_inv = torch.block_diag(*[M_inv] * n_head)
+    return M, M_inv
+
+
+def gen_rope_inv_matrix(n_head, d_head, tele_high, tele_low, tele_sign):
+    if d_head % 2 != 0:
+        raise ValueError(f"d_head must be even for RoPE structure, got d_head={d_head}")
+    dtype = torch.float32
+    two_pi = 2.0 * torch.pi
+
+    def make_head_blocks():
+        blocks = []
+        inv_blocks = []
+        thetas = torch.rand(d_head // 2, dtype=dtype) * two_pi
+        rhos = torch.rand(d_head // 2, dtype=dtype) * (tele_high - tele_low) + tele_low
+        if tele_sign == 1:
+            signs = (torch.randint(0, 2, (d_head // 2,)) * 2 - 1).to(dtype)
+            rhos = rhos * signs
+        cos = torch.cos(thetas)
+        sin = torch.sin(thetas)
+        for c, s, r in zip(cos, sin, rhos):
+            M_block = torch.tensor([[r * c, -r * s], [r * s, r * c]], dtype=dtype)
+            rinv = 1.0 / r
+            M_inv_block = torch.tensor([[rinv * c, rinv * s], [-rinv * s, rinv * c]], dtype=dtype)
+            blocks.append(M_block)
+            inv_blocks.append(M_inv_block)
+        return torch.block_diag(*blocks), torch.block_diag(*inv_blocks)
+
+    per_head_M = []
+    per_head_Minv = []
+    for _ in range(n_head):
+        Mh, Minvh = make_head_blocks()
+        per_head_M.append(Mh)
+        per_head_Minv.append(Minvh)
+    M = torch.block_diag(*per_head_M)
+    M_inv = torch.block_diag(*per_head_Minv)
+    return M, M_inv
+
+
+def teleportation_att(vit_model, M, M_inv, tele_layer):
+    layers = vit_model.vit.encoder.layer
+
+    if tele_layer == "all":
+        for i, block in enumerate(layers):
+            q_linear = block.attention.attention.query
+            k_linear = block.attention.attention.key
+            with torch.no_grad():
+                M = M.to(q_linear.weight.device)
+                M_inv = M_inv.to(k_linear.weight.device)
+                q_linear.weight.data = torch.matmul(M, q_linear.weight.data)
+                q_linear.bias.data = torch.matmul(q_linear.bias.data, torch.transpose(M, -1, -2))
+                k_linear.weight.data = torch.matmul(torch.transpose(M_inv, -1, -2), k_linear.weight.data)
+                k_linear.bias.data = torch.matmul(k_linear.bias.data, M_inv)
+    else:
+        if tele_layer == "first":
+            block = layers[0]
+        else:
+            block = layers[-1]
+
+        q_linear = block.attention.attention.query
+        k_linear = block.attention.attention.key
+        with torch.no_grad():
+            M = M.to(q_linear.weight.device)
+            M_inv = M_inv.to(k_linear.weight.device)
+            q_linear.weight.data = torch.matmul(M, q_linear.weight.data)
+            q_linear.bias.data = torch.matmul(q_linear.bias.data, torch.transpose(M, -1, -2))
+            k_linear.weight.data = torch.matmul(torch.transpose(M_inv, -1, -2), k_linear.weight.data)
+            k_linear.bias.data = torch.matmul(k_linear.bias.data, M_inv)
+
+
+def teleportation_mlp(vit_model, M, M_inv):
+    layers = vit_model.vit.encoder.layer
+    for i, block in enumerate(layers):
+        intermediate_linear = block.intermediate.dense
+        output_linear = block.output.dense
+        with torch.no_grad():
+            M = M.to(intermediate_linear.weight.device)
+            M_inv = M_inv.to(output_linear.weight.device)
+            intermediate_linear.weight.data = torch.matmul(M, intermediate_linear.weight.data)
+            intermediate_linear.bias.data = torch.matmul(intermediate_linear.bias.data, torch.transpose(M, -1, -2))
+            output_linear.weight.data = torch.matmul(output_linear.weight.data, M_inv)
+
+
+def try_naive_teleportation(vit_model, samples, targets, criterion, args, high, low, sign=0):
+    vit_model.eval()
+    base_model = copy.deepcopy(vit_model)
+    base_outputs = base_model(pixel_values=samples).logits
+    base_loss = criterion(base_outputs, targets)
+    base_loss.backward()
+    grad_l2_base = calculate_grad_L2(base_model)
+    max_grad_l2 = grad_l2_base
+    max_M_att = None
+    max_M_mlp = None
+    max_M_att_inv = None
+    max_M_mlp_inv = None
+    count_large_grad = 0
+    for _ in range(args.n_teleport - 1):
+        model_i = copy.deepcopy(vit_model)
+        if args.tele_att:
+            if args.position_embedding == "rope":
+                M_att, M_att_inv = gen_rope_inv_matrix(
+                    n_head=args.num_heads,
+                    d_head=args.d_model // args.num_heads,
+                    tele_high=high,
+                    tele_low=low,
+                    tele_sign=sign,
+                )
+            else:
+                M_att, M_att_inv = gen_inv_matrix(
+                    n_head=args.num_heads,
+                    d_head=args.d_model // args.num_heads,
+                    tele_high=high,
+                    tele_low=low,
+                    tele_sign=sign,
+                )
+            teleportation_att(model_i, M_att, M_att_inv, args.tele_layer)
+        if args.tele_mlp:
+            M_mlp, M_mlp_inv = gen_inv_matrix(
+                n_head=1,
+                d_head=args.intermediate_size,
+                tele_high=high,
+                tele_low=low,
+                tele_sign=sign,
+            )
+            teleportation_mlp(model_i, M_mlp, M_mlp_inv)
+        outputs_i = model_i(pixel_values=samples).logits
+        loss_i = criterion(outputs_i, targets)
+        loss_i.backward()
+        grad_l2_i = calculate_grad_L2(model_i)
+        if grad_l2_i > grad_l2_base:
+            count_large_grad += 1
+        if grad_l2_i > max_grad_l2:
+            max_grad_l2 = grad_l2_i
+            if args.tele_att:
+                max_M_att = M_att
+                max_M_att_inv = M_att_inv
+            if args.tele_mlp:
+                max_M_mlp = M_mlp
+                max_M_mlp_inv = M_mlp_inv
+
+    if count_large_grad > args.n_teleport / 2:
+        if max_M_att is not None and max_M_att_inv is not None:
+            teleportation_att(vit_model, max_M_att, max_M_att_inv, args.tele_layer)
+        if max_M_mlp is not None and max_M_mlp_inv is not None:
+            teleportation_mlp(vit_model, max_M_mlp, max_M_mlp_inv)
+        vit_model.train()
+        return True
+    vit_model.train()
+    return False
 
 
 def validate_bounds(low: float, high: float) -> Tuple[float, float]:
@@ -24,287 +205,437 @@ def validate_bounds(low: float, high: float) -> Tuple[float, float]:
     return low, high
 
 
-def identity_scale(hidden_dim: int) -> torch.Tensor:
-    return torch.ones(hidden_dim, dtype=torch.float32)
+def identity_scale(dim: int) -> torch.Tensor:
+    return torch.ones(dim, dtype=torch.float32)
 
 
-def candidate_scales(hidden_dim: int, low: float, high: float, count: int, seed: int) -> List[torch.Tensor]:
+def validate_qk_scale(scale: torch.Tensor, low: float, high: float, rope: bool) -> torch.Tensor:
+    if scale.ndim != 1:
+        raise ValueError(f"Q/K scale must be a 1D tensor, got shape {tuple(scale.shape)}")
+    if not torch.isfinite(scale).all():
+        raise ValueError("Q/K scale must be finite.")
+    if torch.any(scale <= 0):
+        raise ValueError("Q/K scale must be strictly positive.")
+    identity = torch.ones_like(scale)
+    if not torch.equal(scale, identity) and (torch.any(scale < low) or torch.any(scale > high)):
+        raise ValueError(f"Q/K scale must lie in [{low}, {high}].")
+    if rope:
+        if scale.numel() % 2 != 0:
+            raise ValueError("RoPE Q/K scales require an even number of coordinates.")
+        even = scale[0::2]
+        odd = scale[1::2]
+        if not torch.allclose(even, odd):
+            raise ValueError("RoPE Q/K scales must be tied within each adjacent rotary pair.")
+    return scale
+
+
+def candidate_qk_scales(
+    dim: int,
+    low: float,
+    high: float,
+    count: int,
+    seed: int,
+    rope: bool,
+) -> List[torch.Tensor]:
     validate_bounds(low, high)
     rng = random.Random(seed)
-    candidates: List[torch.Tensor] = [identity_scale(hidden_dim)]
-    log_low = math.log(low)
-    log_high = math.log(high)
+    candidates: List[torch.Tensor] = [identity_scale(dim)]
+    pair_count = dim // 2
+    remainder = dim % 2
     for _ in range(max(0, count - 1)):
-        for _ in range(300):
-            log_scales = torch.empty(hidden_dim, dtype=torch.float32).uniform_(log_low, log_high)
-            log_scales = log_scales - log_scales.mean()
-            scales = torch.exp(log_scales)
-            if torch.all(scales > 0) and torch.all(scales >= low) and torch.all(scales <= high):
-                candidates.append(scales)
-                break
+        values: List[float] = []
+        if rope:
+            for _pair in range(pair_count):
+                scale = math.exp(rng.uniform(math.log(low), math.log(high)))
+                scale = min(high, max(low, scale))
+                values.extend([scale, scale])
+            if remainder:
+                extra = math.exp(rng.uniform(math.log(low), math.log(high)))
+                values.append(min(high, max(low, extra)))
         else:
-            log_scales = torch.linspace(log_low, log_high, steps=hidden_dim)
-            log_scales = log_scales - log_scales.mean()
-            scales = torch.exp(log_scales)
-            candidate = scales / scales.mean().clamp_min(1e-8)
-            candidates.append(candidate)
+            for _idx in range(dim):
+                scale = math.exp(rng.uniform(math.log(low), math.log(high)))
+                values.append(min(high, max(low, scale)))
+        candidate = torch.tensor(values, dtype=torch.float32)
+        validate_qk_scale(candidate, low, high, rope)
+        candidates.append(candidate)
     return candidates
 
 
-def apply_diagonal_transform(model: nn.Module, diag: torch.Tensor) -> None:
-    if not hasattr(model, "hidden") or not hasattr(model, "output"):
-        raise TypeError("apply_diagonal_transform expects a two-layer ReLU MLP with hidden and output attributes.")
-
-    hidden = model.hidden
-    output = model.output
-    diag = diag.to(device=hidden.weight.device, dtype=hidden.weight.dtype)
-    inv_diag = torch.reciprocal(diag).to(device=output.weight.device, dtype=output.weight.dtype)
-
-    with torch.no_grad():
-        hidden.weight.mul_(diag.unsqueeze(1))
-        if hidden.bias is not None:
-            hidden.bias.mul_(diag)
-        output.weight.mul_(inv_diag.unsqueeze(0))
-        if output.bias is not None:
-            output.bias.mul_(1.0)
+def attention_blocks(model: nn.Module, tele_layer: str) -> List[nn.Module]:
+    layers = list(model.vit.encoder.layer)
+    if tele_layer == "all":
+        return layers
+    if tele_layer == "first":
+        return [layers[0]]
+    if tele_layer == "last":
+        return [layers[-1]]
+    raise ValueError(f"Unsupported tele_layer: {tele_layer}")
 
 
-def restore_diagonal_transform(model: nn.Module, diag: torch.Tensor) -> None:
-    if not hasattr(model, "hidden") or not hasattr(model, "output"):
-        raise TypeError("restore_diagonal_transform expects a two-layer ReLU MLP with hidden and output attributes.")
-
-    hidden = model.hidden
-    output = model.output
-    diag = diag.to(device=hidden.weight.device, dtype=hidden.weight.dtype)
-    inv_diag = torch.reciprocal(diag).to(device=output.weight.device, dtype=output.weight.dtype)
-
-    with torch.no_grad():
-        hidden.weight.mul_(inv_diag.unsqueeze(1))
-        if hidden.bias is not None:
-            hidden.bias.mul_(inv_diag)
-        output.weight.mul_(diag.unsqueeze(0))
+def qk_linear_modules(model: nn.Module, tele_layer: str) -> List[Tuple[nn.Linear, nn.Linear]]:
+    pairs = []
+    for block in attention_blocks(model, tele_layer):
+        pairs.append((block.attention.attention.query, block.attention.attention.key))
+    return pairs
 
 
-def compute_grad_norm(model: nn.Module) -> float:
-    grads = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
-    if not grads:
-        return 0.0
-    return sum(grad.norm().item() ** 2 for grad in grads) ** 0.5
+def qk_parameter_items(model: nn.Module, tele_layer: str) -> List[Tuple[str, nn.Parameter]]:
+    selected = {id(module) for pair in qk_linear_modules(model, tele_layer) for module in pair}
+    items = []
+    for name, module in model.named_modules():
+        if id(module) in selected:
+            items.append((f"{name}.weight", module.weight))
+            if module.bias is not None:
+                items.append((f"{name}.bias", module.bias))
+    return items
 
 
-def _make_optimizer_for_model(model: nn.Module, optimizer: torch.optim.Optimizer):
+def qk_weight_parameters(model: nn.Module, tele_layer: str) -> List[nn.Parameter]:
+    weights = []
+    for query, key in qk_linear_modules(model, tele_layer):
+        weights.append(query.weight)
+        weights.append(key.weight)
+    return weights
+
+
+def apply_qk_diagonal_transform(model: nn.Module, scale: torch.Tensor, tele_layer: str, rope: bool, low: float, high: float) -> None:
+    scale = validate_qk_scale(scale.detach().clone().float().cpu(), low, high, rope)
+    for query, key in qk_linear_modules(model, tele_layer):
+        diag = scale.to(device=query.weight.device, dtype=query.weight.dtype)
+        inv = torch.reciprocal(diag)
+        if diag.numel() != query.weight.shape[0] or diag.numel() != key.weight.shape[0]:
+            raise ValueError("Q/K scale length must match projection out_features.")
+        with torch.no_grad():
+            query.weight.mul_(diag.unsqueeze(1))
+            key.weight.mul_(inv.unsqueeze(1))
+            if query.bias is not None:
+                query.bias.mul_(diag)
+            if key.bias is not None:
+                key.bias.mul_(inv)
+
+
+def capture_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: Dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def snapshot_live_state(model: nn.Module, optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
+    named_params = dict(model.named_parameters())
+    named_buffers = dict(model.named_buffers())
+    optimizer_state = {}
+    for name, parameter in named_params.items():
+        raw_state = optimizer.state.get(parameter)
+        if not raw_state:
+            continue
+        cloned = {}
+        for key, value in raw_state.items():
+            cloned[key] = value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+        optimizer_state[name] = cloned
+    return {
+        "training": model.training,
+        "params": {name: parameter.detach().clone() for name, parameter in named_params.items()},
+        "grads": {
+            name: parameter.grad.detach().clone() if parameter.grad is not None else None
+            for name, parameter in named_params.items()
+        },
+        "buffers": {name: buffer.detach().clone() for name, buffer in named_buffers.items()},
+        "optimizer_state": optimizer_state,
+        "optimizer_groups": [
+            {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
+            for group in optimizer.param_groups
+        ],
+    }
+
+
+def assert_live_state_unchanged(model: nn.Module, optimizer: torch.optim.Optimizer, snapshot: Dict[str, Any]) -> None:
+    named_params = dict(model.named_parameters())
+    named_buffers = dict(model.named_buffers())
+    if model.training != snapshot["training"]:
+        raise RuntimeError("Virtual teleportation mutated live training/eval mode.")
+    for name, parameter in named_params.items():
+        if not torch.equal(parameter.detach(), snapshot["params"][name]):
+            raise RuntimeError(f"Virtual teleportation mutated live parameter {name}.")
+        live_grad = parameter.grad
+        snap_grad = snapshot["grads"][name]
+        if live_grad is None and snap_grad is None:
+            continue
+        if live_grad is None or snap_grad is None or not torch.equal(live_grad, snap_grad):
+            raise RuntimeError(f"Virtual teleportation mutated live gradient {name}.")
+    for name, buffer in named_buffers.items():
+        if not torch.equal(buffer, snapshot["buffers"][name]):
+            raise RuntimeError(f"Virtual teleportation mutated live buffer {name}.")
+    for name, parameter in named_params.items():
+        live_state = optimizer.state.get(parameter, {})
+        snap_state = snapshot["optimizer_state"].get(name, {})
+        if set(live_state) != set(snap_state):
+            raise RuntimeError(f"Virtual teleportation mutated optimizer state keys for {name}.")
+        for key, snap_value in snap_state.items():
+            live_value = live_state[key]
+            if torch.is_tensor(snap_value):
+                if not torch.equal(live_value, snap_value):
+                    raise RuntimeError(f"Virtual teleportation mutated optimizer state {name}.{key}.")
+            elif live_value != snap_value:
+                raise RuntimeError(f"Virtual teleportation mutated optimizer state {name}.{key}.")
+
+
+def _make_optimizer_for_model(model: nn.Module, optimizer: torch.optim.Optimizer) -> torch.optim.Optimizer:
     if isinstance(optimizer, torch.optim.AdamW):
+        group = optimizer.param_groups[0]
         return torch.optim.AdamW(
             model.parameters(),
-            lr=optimizer.param_groups[0]["lr"],
-            betas=optimizer.param_groups[0].get("betas", (0.9, 0.999)),
-            eps=optimizer.param_groups[0].get("eps", 1e-8),
-            weight_decay=optimizer.param_groups[0].get("weight_decay", 0.0),
+            lr=group["lr"],
+            betas=group.get("betas", (0.9, 0.999)),
+            eps=group.get("eps", 1e-8),
+            weight_decay=group.get("weight_decay", 0.0),
         )
     if isinstance(optimizer, torch.optim.SGD):
+        group = optimizer.param_groups[0]
         return torch.optim.SGD(
             model.parameters(),
-            lr=optimizer.param_groups[0]["lr"],
-            momentum=optimizer.param_groups[0].get("momentum", 0.0),
-            weight_decay=optimizer.param_groups[0].get("weight_decay", 0.0),
+            lr=group["lr"],
+            momentum=group.get("momentum", 0.0),
+            weight_decay=group.get("weight_decay", 0.0),
         )
-    if optimizer.__class__.__name__.endswith("MuonWithAuxAdam") or "SingleDeviceMuonWithAuxAdam" in optimizer.__class__.__name__:
-        return create_muon_optimizer(
-            model,
-            lr=optimizer.param_groups[0]["lr"],
-            weight_decay=optimizer.param_groups[0].get("weight_decay", 0.0),
-            momentum=optimizer.param_groups[0].get("momentum", 0.95),
-        )
-    return torch.optim.AdamW(
-        model.parameters(),
-        lr=optimizer.param_groups[0]["lr"],
-        weight_decay=optimizer.param_groups[0].get("weight_decay", 0.0),
+    first = optimizer.param_groups[0]
+    clone = create_muon_optimizer(
+        model,
+        lr=first["lr"],
+        weight_decay=first.get("weight_decay", 0.0),
+        momentum=first.get("momentum", 0.95),
     )
+    clone_state_groups_from(optimizer, clone)
+    return clone
 
 
-def clone_state_into_optimizer(model: nn.Module, model_clone: nn.Module, optimizer: torch.optim.Optimizer, optimizer_clone: torch.optim.Optimizer) -> None:
-    real_named = {name: parameter for name, parameter in model.named_parameters()}
-    clone_named = {name: parameter for name, parameter in model_clone.named_parameters()}
-    for name, parameter in real_named.items():
-        if name not in clone_named:
-            continue
-        state = optimizer.state.get(parameter)
-        if state is None:
-            continue
-        clone_state = optimizer_clone.state.get(clone_named[name])
-        if clone_state is None:
-            clone_state = {}
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                clone_state[key] = value.detach().clone()
-            else:
-                clone_state[key] = copy.deepcopy(value)
-        optimizer_clone.state[clone_named[name]] = clone_state
-
-
-def apply_optimizer_state_mode(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    diag: torch.Tensor,
-    state_mode: str,
-) -> None:
-    if state_mode == "keep":
+def clone_state_groups_from(source: torch.optim.Optimizer, dest: torch.optim.Optimizer) -> None:
+    if len(source.param_groups) != len(dest.param_groups):
         return
-    if state_mode not in {"transport", "reset"}:
-        raise ValueError(f"Unsupported teleport state mode: {state_mode}")
+    for source_group, dest_group in zip(source.param_groups, dest.param_groups):
+        for key, value in source_group.items():
+            if key != "params":
+                dest_group[key] = copy.deepcopy(value)
 
-    diag = diag.to(device=model.hidden.weight.device, dtype=model.hidden.weight.dtype)
-    inverse = diag.reciprocal()
-    transformed = {
-        "hidden.weight": (inverse.unsqueeze(1), inverse.square().unsqueeze(1)),
-        "hidden.bias": (inverse, inverse.square()),
-        "output.weight": (diag.unsqueeze(0), diag.square().unsqueeze(0)),
-    }
-    parameters = dict(model.named_parameters())
 
-    for name, (linear_scale, squared_scale) in transformed.items():
-        parameter = parameters[name]
-        if state_mode == "reset":
-            optimizer.state.pop(parameter, None)
-            continue
-
+def clone_optimizer_state(model: nn.Module, model_clone: nn.Module, optimizer: torch.optim.Optimizer, optimizer_clone: torch.optim.Optimizer) -> None:
+    real_named = dict(model.named_parameters())
+    clone_named = dict(model_clone.named_parameters())
+    for name, parameter in real_named.items():
+        clone_parameter = clone_named[name]
         state = optimizer.state.get(parameter)
         if not state:
             continue
+        cloned_state = {}
         for key, value in state.items():
-            if not isinstance(value, torch.Tensor):
-                continue
-            if key in {"momentum_buffer", "exp_avg"}:
-                value.mul_(linear_scale.to(device=value.device, dtype=value.dtype))
-            elif key in {"exp_avg_sq", "max_exp_avg_sq"}:
-                value.mul_(squared_scale.to(device=value.device, dtype=value.dtype))
+            cloned_state[key] = value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+        optimizer_clone.state[clone_parameter] = cloned_state
 
 
-def score_candidate(model: nn.Module, optimizer: torch.optim.Optimizer, batch: Tuple[torch.Tensor, torch.Tensor], criterion: nn.Module, method: str, candidate: torch.Tensor, state_mode: str, low: float, high: float, accept_tol: float, seed: int) -> Dict[str, Any]:
+def clone_model_and_optimizer(model: nn.Module, optimizer: torch.optim.Optimizer) -> Tuple[nn.Module, torch.optim.Optimizer]:
     model_clone = copy.deepcopy(model)
     optimizer_clone = _make_optimizer_for_model(model_clone, optimizer)
-    clone_state_into_optimizer(model, model_clone, optimizer, optimizer_clone)
+    clone_optimizer_state(model, model_clone, optimizer, optimizer_clone)
+    return model_clone, optimizer_clone
 
-    apply_diagonal_transform(model_clone, candidate)
-    apply_optimizer_state_mode(model_clone, optimizer_clone, candidate, state_mode)
-    logits = model_clone(batch[0])
+
+def reset_qk_optimizer_state(model: nn.Module, optimizer: torch.optim.Optimizer, tele_layer: str) -> None:
+    for _, parameter in qk_parameter_items(model, tele_layer):
+        optimizer.state.pop(parameter, None)
+
+
+def parameter_group(optimizer: torch.optim.Optimizer, parameter: nn.Parameter) -> Optional[dict]:
+    for group in optimizer.param_groups:
+        for group_parameter in group["params"]:
+            if group_parameter is parameter:
+                return group
+    return None
+
+
+def reset_muon_update(gradient: torch.Tensor, momentum: float) -> torch.Tensor:
+    momentum_buffer = torch.zeros_like(gradient)
+    grad = gradient.detach().clone()
+    return _muon_update(grad, momentum_buffer, beta=momentum)
+
+
+def compute_qk_muon_alignment(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    tele_layer: str,
+) -> float:
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(pixel_values=batch[0]).logits
     loss = criterion(logits, batch[1])
     loss.backward()
 
-    if method == "grad_norm":
-        return {"score": compute_grad_norm(model_clone), "loss_after": float(loss.detach()), "identity": False}
-    if method == "muon_alignment":
-        dot_total = 0.0
-        for parameter in model_clone.parameters():
-            if parameter.grad is None:
-                continue
-            for state in optimizer_clone.state.values():
-                if "momentum_buffer" in state and state["momentum_buffer"].shape == parameter.grad.shape:
-                    dot_total += float((parameter.grad * state["momentum_buffer"]).sum().item())
-        return {"score": dot_total, "loss_after": float(loss.detach()), "identity": False}
-    if method == "one_step_loss":
-        optimizer_clone.step()
-        with torch.no_grad():
-            post_loss = criterion(model_clone(batch[0]), batch[1]).item()
-        return {"score": float(post_loss), "loss_after": float(post_loss), "identity": False}
-    return {"score": float(loss.detach()), "loss_after": float(loss.detach()), "identity": False}
+    score = 0.0
+    for parameter in qk_weight_parameters(model, tele_layer):
+        group = parameter_group(optimizer, parameter)
+        if group is None or not group.get("use_muon", False) or parameter.grad is None:
+            continue
+        update = reset_muon_update(parameter.grad, momentum=group.get("momentum", 0.95))
+        grad = parameter.grad.detach().float().reshape_as(update)
+        score += float(group["lr"]) * float(torch.sum(grad * update.float()).item())
+    return score
 
 
-def apply_teleportation_to_real_model(model: nn.Module, diag: torch.Tensor, state_mode: str, optimizer: torch.optim.Optimizer) -> None:
-    apply_diagonal_transform(model, diag)
-    apply_optimizer_state_mode(model, optimizer, diag, state_mode)
+def virtual_optimizer_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+) -> float:
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(pixel_values=batch[0]).logits
+    loss = criterion(logits, batch[1])
+    loss.backward()
+    optimizer.step()
+    with torch.no_grad():
+        post_loss = criterion(model(pixel_values=batch[0]).logits, batch[1])
+    return float(post_loss.item())
 
 
-def try_teleportation(model: nn.Module, optimizer: torch.optim.Optimizer, batch: Tuple[torch.Tensor, torch.Tensor], criterion: nn.Module, args: Any, step_index: int) -> Tuple[bool, Dict[str, Any]]:
+def _candidate_sort_key(result: Dict[str, Any]) -> Tuple[float, int]:
+    return (float(result["post_step_loss"]), 0 if result["identity"] else 1)
+
+
+def try_muon_alignment_teleportation(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    args: Any,
+    step_index: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    started = time.perf_counter()
+    rng_state = capture_rng_state()
+    live_snapshot = snapshot_live_state(model, optimizer)
     low, high = validate_bounds(args.tele_low, args.tele_high)
-    hidden_dim = model.hidden.out_features
-    candidate_pool = candidate_scales(hidden_dim, low, high, count=args.tele_candidates, seed=args.seed + step_index)
-    base_loss = criterion(model(batch[0]), batch[1]).item()
-    best: Dict[str, Any] = {"scale": identity_scale(hidden_dim), "score": float("inf"), "loss_after": base_loss, "identity": True}
-    result_log: List[Dict[str, Any]] = []
+    rope = args.position_embedding == "rope"
+    query = qk_linear_modules(model, args.tele_layer)[0][0]
+    dim = query.out_features
+    candidates = candidate_qk_scales(
+        dim=dim,
+        low=low,
+        high=high,
+        count=args.tele_candidates,
+        seed=args.seed + step_index,
+        rope=rope,
+    )
 
-    for idx, scale in enumerate(candidate_pool):
-        if args.tele_method == "none":
-            return False, {"method": "none", "accepted": False, "candidate": None, "step": step_index, "base_loss": base_loss}
+    was_training = model.training
+    model.train()
+    regular_model, regular_optimizer = clone_model_and_optimizer(model, optimizer)
+    regular_loss = virtual_optimizer_step(regular_model, regular_optimizer, batch, criterion)
 
-        model_candidate = copy.deepcopy(model)
-        optimizer_candidate = _make_optimizer_for_model(model_candidate, optimizer)
-        clone_state_into_optimizer(model, model_candidate, optimizer, optimizer_candidate)
-        apply_diagonal_transform(model_candidate, scale)
-        apply_optimizer_state_mode(model_candidate, optimizer_candidate, scale, args.tele_state_mode)
+    results: List[Dict[str, Any]] = []
+    for index, scale in enumerate(candidates):
+        align_model, align_optimizer = clone_model_and_optimizer(model, optimizer)
+        apply_qk_diagonal_transform(align_model, scale, args.tele_layer, rope, low, high)
+        alignment = compute_qk_muon_alignment(align_model, align_optimizer, batch, criterion, args.tele_layer)
 
-        logits = model_candidate(batch[0])
-        loss = criterion(logits, batch[1])
-        loss.backward()
-        if args.tele_method == "grad_norm":
-            score = compute_grad_norm(model_candidate)
-            better = score > (best["score"] if best["score"] != float("inf") else -1e30)
-        elif args.tele_method == "muon_alignment":
-            score = 0.0
-            for parameter in model_candidate.parameters():
-                if parameter.grad is None:
-                    continue
-                for state in optimizer_candidate.state.values():
-                    if "momentum_buffer" in state and state["momentum_buffer"].shape == parameter.grad.shape:
-                        score += float((parameter.grad * state["momentum_buffer"]).sum().item())
-            better = score > (best["score"] if best["score"] != float("inf") else -1e30)
-        elif args.tele_method == "one_step_loss":
-            optimizer_candidate.step()
-            score = criterion(model_candidate(batch[0]), batch[1]).item()
-            better = score < best["score"]
-        elif args.tele_method == "naive":
-            score = float(loss.item())
-            better = False
-        else:
-            score = float(loss.item())
-            better = score < best["score"]
-
-        if better:
-            best = {
-                "scale": scale.detach().clone(),
-                "score": float(score),
-                "loss_after": float(loss.item()),
-                "identity": idx == 0,
-                "idx": idx,
+        step_model, step_optimizer = clone_model_and_optimizer(model, optimizer)
+        apply_qk_diagonal_transform(step_model, scale, args.tele_layer, rope, low, high)
+        reset_qk_optimizer_state(step_model, step_optimizer, args.tele_layer)
+        post_loss = virtual_optimizer_step(step_model, step_optimizer, batch, criterion)
+        results.append(
+            {
+                "candidate_index": index,
+                "identity": index == 0,
+                "scale": scale.detach().cpu().tolist(),
+                "scale_min": float(scale.min()),
+                "scale_max": float(scale.max()),
+                "alignment": float(alignment),
+                "post_step_loss": float(post_loss),
             }
-        result_log.append({"candidate_index": idx, "scale": scale.tolist(), "score": float(score), "identity": idx == 0})
+        )
 
-    identity_reference = next(item for item in result_log if item["identity"])
-    selected = best
-    selected_score = selected["score"]
-    if args.tele_method == "naive" and len(candidate_pool) > 1:
-        selected_index = random.Random(args.seed + step_index).randrange(1, len(candidate_pool))
-        selected = {
-            "scale": candidate_pool[selected_index],
-            "score": result_log[selected_index]["score"],
-            "identity": False,
-        }
-        selected_score = selected["score"]
+    restore_rng_state(rng_state)
+    model.train(was_training)
+    assert_live_state_unchanged(model, optimizer, live_snapshot)
+
+    identity_result = next(result for result in results if result["identity"])
+    selected = min(results, key=_candidate_sort_key)
+    epsilon = float(args.tele_accept_tol)
+    accepted = False
+    reason = "rejected"
+    if selected["identity"]:
+        reason = "reset_only"
+    elif selected["post_step_loss"] < regular_loss - epsilon:
         accepted = True
-    elif args.tele_method in {"grad_norm", "muon_alignment"}:
-        accepted = bool(selected_score > identity_reference["score"] + args.tele_accept_tol)
-    elif args.tele_method == "one_step_loss":
-        accepted = bool(selected_score < identity_reference["score"] - args.tele_accept_tol)
+        reason = "accepted_better_than_regular_muon"
     else:
-        accepted = False
+        reason = "rejected_did_not_beat_regular_muon"
 
     if accepted:
-        return True, {
-            "method": args.tele_method,
-            "accepted": True,
-            "candidate": selected["scale"].tolist(),
-            "scale_min": float(selected["scale"].min()),
-            "scale_max": float(selected["scale"].max()),
-            "base_loss": base_loss,
-            "step": step_index,
-            "results": result_log,
-        }
+        apply_qk_diagonal_transform(
+            model,
+            torch.tensor(selected["scale"], dtype=torch.float32),
+            args.tele_layer,
+            rope,
+            low,
+            high,
+        )
+        reset_qk_optimizer_state(model, optimizer, args.tele_layer)
 
-    return False, {
-        "method": args.tele_method,
-        "accepted": False,
-        "candidate": None,
-        "base_loss": base_loss,
+    telemetry = {
+        "method": "muon_alignment",
+        "accepted": accepted,
+        "reason": reason,
         "step": step_index,
-        "results": result_log,
+        "search_time_seconds": round(time.perf_counter() - started, 6),
+        "regular_muon_post_step_loss": regular_loss,
+        "identity_reset_loss": identity_result["post_step_loss"],
+        "identity_alignment": identity_result["alignment"],
+        "selected_alignment": selected["alignment"],
+        "selected_post_step_loss": selected["post_step_loss"],
+        "selected_identity": selected["identity"],
+        "selected_scale": selected["scale"],
+        "scale_min": selected["scale_min"],
+        "scale_max": selected["scale_max"],
+        "state_reset": accepted,
+        "tele_layer": args.tele_layer,
+        "results": results,
     }
+    return accepted, telemetry
+
+
+def try_teleportation(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    args: Any,
+    step_index: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    method = getattr(args, "tele_method", "none")
+    if method in {"none", None}:
+        return False, {"method": "none", "accepted": False, "step": step_index}
+    if method == "naive":
+        accepted = try_naive_teleportation(
+            vit_model=model,
+            samples=batch[0],
+            targets=batch[1],
+            criterion=criterion,
+            args=args,
+            high=args.tele_high,
+            low=args.tele_low,
+            sign=args.tele_sign,
+        )
+        return accepted, {"method": "naive", "accepted": accepted, "step": step_index}
+    if method == "muon_alignment":
+        return try_muon_alignment_teleportation(model, optimizer, batch, criterion, args, step_index)
+    raise ValueError(f"Unsupported tele_method: {method}")
