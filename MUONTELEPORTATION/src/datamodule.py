@@ -30,7 +30,7 @@ def get_mnist_dataloaders(args):
     return train_loader, val_loader
 
 def get_cifar10_dataloaders(args):
-    train_transform = transforms.Compose([
+    transform = transforms.Compose([
         transforms.RandomCrop(args.img_size, padding=args.padding),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
