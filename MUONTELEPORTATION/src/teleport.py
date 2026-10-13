@@ -665,7 +665,8 @@ def try_muon_alignment_teleportation(
     finally:
         restore_rng_state(rng_state)
         model.train(was_training)
-        assert_live_state_unchanged(model, optimizer, live_snapshot)
+        if not accepted:
+            assert_live_state_unchanged(model, optimizer, live_snapshot)
 
 def try_teleportation(
     model: nn.Module,
