@@ -1,9 +1,6 @@
 import argparse
-import copy
 import json
-import os
 import random
-import time
 from pathlib import Path
 
 import torch
@@ -13,37 +10,43 @@ from tqdm import tqdm
 
 from datamodule import get_dataset
 from logger import TrainingLogger
-from model import SimpleMLP
+from model import build_vit
 from muon import create_muon_optimizer
-from teleport import apply_teleportation_to_real_model, try_teleportation
-
-
-def list_of_ints(value: str):
-    return [int(item) for item in value.split(",") if item.strip()]
+from vit_alignment import try_vit_alignment_teleportation
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Muon-aware teleportation prototype on MNIST and CIFAR-10.")
+    parser = argparse.ArgumentParser(description="Train a ViT with optimizer baselines and alignment teleportation.")
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--dataset", type=str, choices=["MNIST", "CIFAR10"], required=True)
     parser.add_argument("--save-dir", type=str, default="./checkpoints")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--muon-lr", type=float, default=0.02)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
     parser.add_argument("--opt", type=str, default="muon", choices=["adamw", "sgd", "muon"])
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--num-hidden-layer", type=int, default=4)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--intermediate-size", type=int, default=512)
+    parser.add_argument("--patch-size", type=int, default=4)
+    parser.add_argument(
+        "--position-embedding",
+        type=str,
+        default="rope",
+        choices=["rope", "learnable"],
+    )
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--img-size", type=int, default=32)
     parser.add_argument("--padding", type=int, default=4)
 
-    parser.add_argument("--tele-method", type=str, default="one_step_loss", choices=["none", "naive", "grad_norm", "muon_alignment", "one_step_loss"])
-    parser.add_argument("--tele-state-mode", type=str, default="keep", choices=["keep", "transport", "reset"])
+    parser.add_argument("--tele-method", type=str, default="none", choices=["none", "muon_alignment"])
+    parser.add_argument("--tele-state-mode", type=str, default="reset", choices=["reset"])
     parser.add_argument("--tele-candidates", type=int, default=6)
     parser.add_argument("--tele-interval", type=int, default=1)
     parser.add_argument("--tele-start-step", type=int, default=0)
@@ -51,7 +54,6 @@ def parse_args():
     parser.add_argument("--tele-low", type=float, default=0.7)
     parser.add_argument("--tele-high", type=float, default=1.5)
     parser.add_argument("--tele-accept-tol", type=float, default=1e-6)
-    parser.add_argument("--warp-loss", action="store_true")
     return parser.parse_args()
 
 
@@ -65,19 +67,37 @@ def build_optimizer(model, args):
 
 def main():
     args = parse_args()
+    if args.tele_interval < 1:
+        raise ValueError("--tele-interval must be at least 1.")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    input_dim = 28 * 28 if args.dataset == "MNIST" else 32 * 32 * 3
-    model = SimpleMLP(input_dim=input_dim, hidden_dim=args.hidden_dim, num_classes=args.num_classes).to(device)
+    image_size = 28 if args.dataset == "MNIST" else args.img_size
+    num_channels = 1 if args.dataset == "MNIST" else 3
+    model = build_vit(
+        image_size=image_size,
+        num_channels=num_channels,
+        num_classes=args.num_classes,
+        hidden_size=args.d_model,
+        num_hidden_layers=args.num_hidden_layer,
+        num_attention_heads=args.num_heads,
+        intermediate_size=args.intermediate_size,
+        patch_size=args.patch_size,
+        position_embedding=args.position_embedding,
+    ).to(device)
     train_loader, val_loader = get_dataset(args)
     optimizer = build_optimizer(model, args)
     criterion = nn.CrossEntropyLoss()
 
+    optimizer_lr = args.muon_lr if args.opt == "muon" else args.lr
     run_name = (
-        f"{args.dataset}_{args.opt}_{args.tele_method}_{args.tele_state_mode}_"
-        f"seed{args.seed}_lr{args.lr}_batch{args.batch_size}_cands{args.tele_candidates}_interval{args.tele_interval}"
+        f"ViT_{args.dataset}_{args.opt}_{args.tele_method}_{args.tele_state_mode}_"
+        f"seed{args.seed}_epochs{args.epochs}_batch{args.batch_size}_"
+        f"model{args.d_model}x{args.num_hidden_layer}h{args.num_heads}_"
+        f"pos{args.position_embedding}_"
+        f"lr{optimizer_lr}_wd{args.weight_decay}_"
+        f"cands{args.tele_candidates}_interval{args.tele_interval}"
     )
     save_dir = Path(args.save_dir) / run_name
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -86,7 +106,12 @@ def main():
         save_dir=str(save_dir),
         run_name=run_name,
         config=vars(args),
-        environment={"device": str(device), "torch_version": torch.__version__},
+        environment={
+            "device": str(device),
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+            "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        },
         dataset={"name": args.dataset, "train_samples": len(train_loader.dataset), "validation_samples": len(val_loader.dataset)},
         model={"parameter_count": sum(parameter.numel() for parameter in model.parameters())},
     )
@@ -101,20 +126,28 @@ def main():
             for images, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
                 images, labels = images.to(device), labels.to(device)
 
-                if args.tele_method != "none" and step_index >= args.tele_start_step and (args.tele_limit < 0 or step_index < args.tele_limit):
+                if (
+                    args.tele_method == "muon_alignment"
+                    and step_index >= args.tele_start_step
+                    and (args.tele_limit < 0 or step_index < args.tele_limit)
+                ):
                     if (step_index % args.tele_interval) == 0:
-                        accepted, info = try_teleportation(model, optimizer, (images, labels), criterion, args, step_index)
+                        accepted, info = try_vit_alignment_teleportation(
+                            model,
+                            optimizer,
+                            (images, labels),
+                            criterion,
+                            low=args.tele_low,
+                            high=args.tele_high,
+                            candidate_count=args.tele_candidates,
+                            accept_tolerance=args.tele_accept_tol,
+                            seed=args.seed + step_index,
+                        )
                         if accepted:
-                            apply_teleportation_to_real_model(
-                                model,
-                                torch.tensor(info["candidate"], device=device),
-                                args.tele_state_mode,
-                                optimizer,
-                            )
                             logger.data.setdefault("telemetry", []).append(info)
 
                 optimizer.zero_grad(set_to_none=True)
-                outputs = model(images)
+                outputs = model(pixel_values=images).logits
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
@@ -128,7 +161,7 @@ def main():
             with torch.no_grad():
                 for images, labels in val_loader:
                     images, labels = images.to(device), labels.to(device)
-                    logits = model(images)
+                    logits = model(pixel_values=images).logits
                     loss = criterion(logits, labels)
                     val_loss += loss.item()
                     preds = logits.argmax(dim=1)

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 from torch import nn
-from muon import create_muon_optimizer
+from .muon import create_muon_optimizer
 
 @dataclass
 class CandidateResult:

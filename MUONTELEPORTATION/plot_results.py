@@ -26,13 +26,14 @@ def load_runs(results_dir: Path) -> list[dict]:
 
         method = config.get("tele_method", "unknown")
         state_mode = config.get("tele_state_mode", "unknown")
+        optimizer = config.get("opt", "unknown")
         runs.append(
             {
                 "path": log_path,
                 "dataset": dataset,
                 "method": method,
                 "state_mode": state_mode,
-                "label": f"{method} / {state_mode}",
+                "label": f"{optimizer} / {method} / {state_mode}",
                 "epochs": epochs,
                 "best_val_acc": log.get("best_val_acc"),
             }
@@ -89,7 +90,7 @@ def plot_best_accuracy(runs: list[dict], output_dir: Path) -> None:
     bars = axis.bar(range(len(runs)), scores)
     axis.set(
         title="Best validation accuracy by experiment",
-        xlabel="Dataset / method / state mode",
+        xlabel="Dataset / optimizer / method / state mode",
         ylabel="Best validation accuracy",
         ylim=(0, 1),
     )

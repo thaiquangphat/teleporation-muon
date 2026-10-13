@@ -1,15 +1,11 @@
 # MUONTELEPORTATION
 
-This prototype follows the research plan in `agent_instructions_muon_aware_teleportation.md` and mirrors the repository's `MNISTCIFAR` conventions: a small, deterministic training loop, JSON metrics logging, and simple shell scripts for repeated runs.
-
-## Reference implementation reused
-
-The source-of-truth baseline for the existing teleportation idea and optimizer structure is:
-
-- `MNISTCIFAR/src/teleport.py` — the original generation of random invertible matrices and gradient-based teleportation checks
-- `MNISTCIFAR/src/muon.py` — the Muon update logic (`SingleDeviceMuonWithAuxAdam` and `create_muon_optimizer`)
-
-This new folder intentionally keeps the original baseline available and adds an explicit Muon-aware candidate selector rather than changing the existing behavior.
+This folder compares a locally implemented, configurable Vision Transformer
+on MNIST or CIFAR-10 using Muon, AdamW, and SGD, with and without
+Muon-alignment teleportation. The model is built from PyTorch layers, so its
+patch embedding, attention, encoder, normalization, and classifier are
+directly controlled here. Dataset loading and the custom Muon optimizer
+follow the repository's `MNISTCIFAR` implementation.
 
 ## Setup
 
@@ -18,81 +14,45 @@ cd MUONTELEPORTATION
 python -m pip install -r requirements.txt
 ```
 
-## Baseline run
+## Six-experiment run
+
+Run `scripts.sh` from this folder. It executes exactly six runs for the
+selected dataset: three optimizer baselines followed by the same three
+optimizers with `muon_alignment` teleportation and optimizer-state reset.
+CIFAR-10 is the default; select MNIST with `DATASET=MNIST`.
 
 ```bash
-python src/train.py --dataset MNIST --seed 1 --epochs 3 --batch-size 128 --opt muon --lr 0.015 --momentum 0.9 --weight-decay 1e-4
+bash scripts.sh
+DATASET=MNIST SEED=7 EPOCHS=30 bash scripts.sh
 ```
 
-The baseline is the `--tele-method none` path. The `naive` MLP comparator
-samples and applies a non-identity bounded ReLU scaling without scoring
-candidate updates.
+The model size, teleport candidate count, interval, optimizer-specific
+learning rates (`MUON_LR`, `ADAMW_LR`, and `SGD_LR`), and output directory can
+be controlled with the environment variables defined in the script. SGD uses
+the ViT reference rates of `0.015` for MNIST and `0.005` for CIFAR-10 by
+default; the AdamW default is `3e-4` and Muon's is `0.015`. Each run writes
+JSON metrics and its best checkpoint under
+`checkpoints/<dataset>_six_experiments_seed<seed>/`. After all six runs
+complete, the script plots validation accuracy and loss for each optimizer
+and method.
 
-## New Muon-aware methods
+## Model and teleportation behavior
 
-The new prototype supports:
+The model uses convolutional patch embeddings, a class token,
+pre-normalized multi-head self-attention and GELU MLP blocks, final layer
+normalization, and a classification head. RoPE is the default positional
+embedding (`POSITION_EMBEDDING=rope`); learned position embeddings are also
+available. No external ViT implementation is used.
 
-- `none`: plain Muon baseline
-- `naive`: existing random teleportation logic
-- `grad_norm`: control that compares candidate gradient norms
-- `muon_alignment`: candidate score based on the repo's actual Muon update direction
-- `one_step_loss`: primary method using a virtual Muon step and loss comparison
-
-State handling is controlled with `--tele-state-mode`:
-
-- `keep`
-- `transport`
-- `reset`
-
-For `transport`, the hidden-layer Muon momentum is scaled by the inverse
-hidden scale, hidden-bias Adam first/second moments by the inverse/squared
-inverse scale, and output-layer Muon momentum by the hidden scale along its
-input dimension. Unrelated state, including output-bias state, is unchanged.
-
-Example:
-
-```bash
-python src/train.py --dataset MNIST --seed 1 --epochs 3 --batch-size 128 --opt muon \
-  --tele-method one_step_loss --tele-state-mode transport --tele-candidates 8 \
-  --tele-interval 1 --tele-low 0.7 --tele-high 1.5 --tele-accept-tol 1e-6
-```
-
-## Notes
-
-- The function-preserving transform is the ReLU scaling symmetry for a two-layer MLP:
-  - `W1' = D W1`, `b1' = D b1`, `W2' = W2 D^{-1}`
-- Muon-aware candidate search includes the identity transform, and applies the selected transform only when it improves on identity by at least `--tele-accept-tol`.
-- Candidate generation is deterministic for a fixed seed and logs all relevant configuration and selection stats in the run directory.
-
-## Output
-
-Each run writes JSON metrics and checkpoints under:
-
-```text
-MUONTELEPORTATION/checkpoints/<run_name>/
-```
-
-The folder contains the run config, log, last checkpoint, and best checkpoint.
-
-## Run the experiment matrix
-
-From this directory, run:
-
-```bash
-bash run_all_experiments.sh
-```
-
-The script runs MNIST and CIFAR-10 with one seed (default `1`) and 30 epochs,
-first running the plain Muon baseline and then all four teleportation methods
-with each state mode. Once every training command succeeds, it plots validation
-accuracy/loss curves and best validation accuracy under
-`checkpoints/all_settings_seed1/figures/`.
-
-Defaults can be overridden with environment variables, for example:
-
-```bash
-SEED=7 EPOCHS=30 DATASETS="MNIST" bash run_all_experiments.sh
-```
-
-Install the plotting dependency with `python -m pip install -r requirements.txt`
-before running if it is not already available.
+For each ViT attention block, the selected positive diagonal scaling `D`
+transforms the query and key projections as `Q' = DQ` and `K' = D^-1 K`.
+Therefore `Q'K'^T = QK^T`, preserving attention scores and model outputs up
+to floating-point rounding. The identity candidate is always included.
+With RoPE, candidate scales are tied within each adjacent rotary channel pair
+and sampled independently per attention head, so they commute with the
+position rotations and preserve the same invariance.
+Candidate scoring runs a virtual optimizer step from fresh state for the
+transformed query/key projections and ranks candidates by gradient alignment
+with that optimizer's actual update. If a non-identity candidate beats
+identity by `--tele-accept-tol`, it is applied to the live model and optimizer
+state for the transformed query/key projections is reset.
