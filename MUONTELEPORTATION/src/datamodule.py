@@ -105,13 +105,13 @@ def get_cifar100_dataloaders(args):
     ])
     val_transform = transforms.Compose(val_ops)
 
-    train_dataset = datasets.CIFAR10(
+    train_dataset = datasets.CIFAR100(
         root=args.data_dir,
         train=True,
         download=True,
         transform=train_transform,
     )
-    val_dataset = datasets.CIFAR10(
+    val_dataset = datasets.CIFAR100(
         root=args.data_dir,
         train=False,
         download=True,
