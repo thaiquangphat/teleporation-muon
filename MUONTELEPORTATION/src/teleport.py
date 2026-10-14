@@ -543,6 +543,7 @@ def try_muon_alignment_teleportation(
         raise ValueError("muon_alignment requires at least one non-identity candidate; --tele-candidates must be >= 2.")
 
     was_training = model.training
+    accepted = False
     model.train()
     try:
         candidates = candidate_qk_scales(
@@ -608,6 +609,18 @@ def try_muon_alignment_teleportation(
         best_non_identity = min(non_identity_results, key=lambda item: float(item["post_step_loss"])) if non_identity_results else None
         epsilon = float(args.tele_accept_tol)
 
+        identity_reset_loss = identity_result["post_step_loss"]
+        beats_regular = (
+            best_non_identity is not None
+            and best_non_identity["post_step_loss"] < regular_loss - epsilon
+        )
+        beats_reset_only = (
+            best_non_identity is not None
+            and identity_reset_loss is not None
+            and best_non_identity["post_step_loss"]
+                < identity_reset_loss - epsilon
+        )
+
         accepted = False
         reason = "rejected"
         if best_non_identity is not None and best_non_identity["post_step_loss"] < regular_loss - epsilon:
@@ -647,6 +660,9 @@ def try_muon_alignment_teleportation(
             "identity_reset_loss": float(identity_result["post_step_loss"]),
             "identity_alignment": float(identity_result["alignment"]),
             "best_non_identity_candidate_loss": float(best_non_identity["post_step_loss"]) if best_non_identity is not None else None,
+            "beats_regular_baseline": beats_regular,
+            "beats_reset_only": beats_reset_only,
+            "accepted_beyond_reset_only": accepted and beats_reset_only,
             "selected_alignment": float(selected["alignment"]),
             "selected_post_step_loss": float(selected["post_step_loss"]) if selected["post_step_loss"] is not None else None,
             "selected_identity": bool(selected["identity"]),
@@ -658,6 +674,10 @@ def try_muon_alignment_teleportation(
             "tele_layer": args.tele_layer,
             "alignment_gain": alignment_gain,
             "post_loss_gain": post_loss_gain,
+            "proposed_candidate_index": (best_non_identity["candidate_index"] if best_non_identity is not None else None),
+            "proposed_post_loss_gain": (regular_loss - best_non_identity["post_step_loss"] if best_non_identity is not None and best_non_identity["post_step_loss"] is not None else None),
+            "accepted_candidate_index": (best_non_identity["candidate_index"] if accepted and best_non_identity is not None else None),
+            "accepted_post_loss_gain": (regular_loss - best_non_identity["post_step_loss"] if accepted and best_non_identity is not None else None),
             "shortlist_size": shortlist_size,
             "results": results,
         }
