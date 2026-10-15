@@ -88,47 +88,53 @@ def gen_rope_inv_matrix(n_head, d_head, tele_high, tele_low, tele_sign):
 
 
 def teleportation_att(vit_model, M, M_inv, tele_layer):
+    """Apply the MNISTCIFAR Q/K symmetry while preserving this public API.
+
+    For row-vector activations, this implements Q' = M Q and
+    K' = M^{-T} K, with the corresponding bias transformations.
+    """
     layers = vit_model.vit.encoder.layer
-
     if tele_layer == "all":
-        for i, block in enumerate(layers):
-            q_linear = block.attention.attention.query
-            k_linear = block.attention.attention.key
-            with torch.no_grad():
-                M = M.to(q_linear.weight.device)
-                M_inv = M_inv.to(k_linear.weight.device)
-                q_linear.weight.data = torch.matmul(M, q_linear.weight.data)
-                q_linear.bias.data = torch.matmul(q_linear.bias.data, torch.transpose(M, -1, -2))
-                k_linear.weight.data = torch.matmul(torch.transpose(M_inv, -1, -2), k_linear.weight.data)
-                k_linear.bias.data = torch.matmul(k_linear.bias.data, M_inv)
+        selected_layers = layers
+    elif tele_layer == "first":
+        selected_layers = [layers[0]]
+    elif tele_layer == "last":
+        selected_layers = [layers[-1]]
     else:
-        if tele_layer == "first":
-            block = layers[0]
-        else:
-            block = layers[-1]
+        raise ValueError(f"Unsupported tele_layer: {tele_layer}")
 
+    for block in selected_layers:
         q_linear = block.attention.attention.query
         k_linear = block.attention.attention.key
+        q_transform = M.to(device=q_linear.weight.device, dtype=q_linear.weight.dtype)
+        k_inverse = M_inv.to(device=k_linear.weight.device, dtype=k_linear.weight.dtype)
         with torch.no_grad():
-            M = M.to(q_linear.weight.device)
-            M_inv = M_inv.to(k_linear.weight.device)
-            q_linear.weight.data = torch.matmul(M, q_linear.weight.data)
-            q_linear.bias.data = torch.matmul(q_linear.bias.data, torch.transpose(M, -1, -2))
-            k_linear.weight.data = torch.matmul(torch.transpose(M_inv, -1, -2), k_linear.weight.data)
-            k_linear.bias.data = torch.matmul(k_linear.bias.data, M_inv)
+            q_linear.weight.copy_(q_transform @ q_linear.weight)
+            if q_linear.bias is not None:
+                q_linear.bias.copy_(q_linear.bias @ q_transform.mT)
+            k_linear.weight.copy_(k_inverse.mT @ k_linear.weight)
+            if k_linear.bias is not None:
+                k_linear.bias.copy_(k_linear.bias @ k_inverse)
 
 
 def teleportation_mlp(vit_model, M, M_inv):
+    """Apply the MNISTCIFAR hidden-unit symmetry to every MLP block.
+
+    For ReLU networks, M must be a positive monomial matrix (a permutation
+    combined with positive diagonal scaling); candidate generation below
+    enforces that by disabling signed MLP scales.
+    """
     layers = vit_model.vit.encoder.layer
-    for i, block in enumerate(layers):
+    for block in layers:
         intermediate_linear = block.intermediate.dense
         output_linear = block.output.dense
+        transform = M.to(device=intermediate_linear.weight.device, dtype=intermediate_linear.weight.dtype)
+        inverse = M_inv.to(device=output_linear.weight.device, dtype=output_linear.weight.dtype)
         with torch.no_grad():
-            M = M.to(intermediate_linear.weight.device)
-            M_inv = M_inv.to(output_linear.weight.device)
-            intermediate_linear.weight.data = torch.matmul(M, intermediate_linear.weight.data)
-            intermediate_linear.bias.data = torch.matmul(intermediate_linear.bias.data, torch.transpose(M, -1, -2))
-            output_linear.weight.data = torch.matmul(output_linear.weight.data, M_inv)
+            intermediate_linear.weight.copy_(transform @ intermediate_linear.weight)
+            if intermediate_linear.bias is not None:
+                intermediate_linear.bias.copy_(intermediate_linear.bias @ transform.mT)
+            output_linear.weight.copy_(output_linear.weight @ inverse)
 
 
 def try_naive_teleportation(vit_model, samples, targets, criterion, args, high, low, sign=0):
@@ -170,7 +176,9 @@ def try_naive_teleportation(vit_model, samples, targets, criterion, args, high, 
                 d_head=args.intermediate_size,
                 tele_high=high,
                 tele_low=low,
-                tele_sign=sign,
+                # The repo ViT uses ReLU, which preserves positive monomial
+                # hidden-unit changes but not arbitrary sign flips.
+                tele_sign=0,
             )
             teleportation_mlp(model_i, M_mlp, M_mlp_inv)
         outputs_i = model_i(pixel_values=samples).logits
@@ -313,6 +321,209 @@ def apply_qk_diagonal_transform(model: nn.Module, scale: torch.Tensor, tele_laye
                 query.bias.mul_(diag)
             if key.bias is not None:
                 key.bias.mul_(inv)
+
+
+def _matrix_scale_summary(matrix: Optional[torch.Tensor]) -> List[float]:
+    if matrix is None:
+        return []
+    # The row norms are the actual per-coordinate scale factors for the
+    # monomial matrices and rho*rotation blocks used by the source framework.
+    return torch.linalg.vector_norm(matrix.float(), ord=2, dim=1).detach().cpu().tolist()
+
+
+def generate_symmetry_candidates(
+    model: nn.Module,
+    args: Any,
+    low: float,
+    high: float,
+    count: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Generate identity plus MNISTCIFAR symmetry-preserving transforms.
+
+    Keeps count semantics (identity included) and uses the existing CLI flags.
+    The sampled attention transform is a general monomial matrix without RoPE,
+    or a block-diagonal scaled rotation when RoPE is active. MLP candidates use
+    positive monomial matrices so the ReLU hidden-unit symmetry is preserved.
+    """
+    validate_bounds(low, high)
+    use_attention = bool(getattr(args, "tele_att", 1))
+    use_mlp = bool(getattr(args, "tele_mlp", 0))
+    if not use_attention and not use_mlp:
+        raise ValueError("muon_alignment requires --tele-att 1, --tele-mlp 1, or both.")
+
+    layers = list(model.vit.encoder.layer)
+    if use_attention:
+        q_linear = qk_linear_modules(model, args.tele_layer)[0][0]
+        d_model = q_linear.out_features
+        n_head = int(args.num_heads)
+        if n_head <= 0 or d_model % n_head != 0:
+            raise ValueError(f"Q/K output size {d_model} must be divisible by num_heads={n_head}.")
+        d_head = d_model // n_head
+        rope = getattr(args, "position_embedding", "learnable") == "rope"
+    if use_mlp:
+        mlp_dim = layers[0].intermediate.dense.out_features
+
+    original_rng = capture_rng_state()
+    candidates: List[Dict[str, Any]] = []
+    try:
+        # Candidate generation uses the same source-file matrix generators but
+        # is deterministic per (seed, step) and leaves the caller RNG untouched.
+        torch.manual_seed(int(seed))
+        for index in range(max(0, int(count))):
+            candidate: Dict[str, Any] = {
+                "identity": index == 0,
+                "M_att": None,
+                "M_att_inv": None,
+                "M_mlp": None,
+                "M_mlp_inv": None,
+            }
+            if use_attention:
+                if index == 0:
+                    matrix = torch.eye(d_model, dtype=torch.float32)
+                    matrix_inv = matrix.clone()
+                elif rope:
+                    matrix, matrix_inv = gen_rope_inv_matrix(
+                        n_head=n_head,
+                        d_head=d_head,
+                        tele_high=high,
+                        tele_low=low,
+                        tele_sign=int(getattr(args, "tele_sign", 0)),
+                    )
+                else:
+                    matrix, matrix_inv = gen_inv_matrix(
+                        n_head=n_head,
+                        d_head=d_head,
+                        tele_high=high,
+                        tele_low=low,
+                        tele_sign=int(getattr(args, "tele_sign", 0)),
+                    )
+                candidate["M_att"] = matrix
+                candidate["M_att_inv"] = matrix_inv
+            if use_mlp:
+                if index == 0:
+                    matrix = torch.eye(mlp_dim, dtype=torch.float32)
+                    matrix_inv = matrix.clone()
+                else:
+                    # ReLU is not sign-equivariant. Positive monomial matrices
+                    # are the valid hidden-unit symmetry, so MLP sign flips are
+                    # intentionally excluded while preserving the same API.
+                    matrix, matrix_inv = gen_inv_matrix(
+                        n_head=1,
+                        d_head=mlp_dim,
+                        tele_high=high,
+                        tele_low=low,
+                        tele_sign=0,
+                    )
+                candidate["M_mlp"] = matrix
+                candidate["M_mlp_inv"] = matrix_inv
+            candidate["attention_scale_summary"] = _matrix_scale_summary(candidate["M_att"])
+            candidate["mlp_scale_summary"] = _matrix_scale_summary(candidate["M_mlp"])
+            # Preserve the legacy `scale` field as the primary transform's
+            # coordinate scales, while aggregate bounds cover every active family.
+            candidate["scale_summary"] = (
+                candidate["attention_scale_summary"]
+                if use_attention
+                else candidate["mlp_scale_summary"]
+            )
+            all_scales = candidate["attention_scale_summary"] + candidate["mlp_scale_summary"]
+            candidate["scale_min"] = min(all_scales) if all_scales else 1.0
+            candidate["scale_max"] = max(all_scales) if all_scales else 1.0
+            candidates.append(candidate)
+    finally:
+        restore_rng_state(original_rng)
+    if not candidates or not candidates[0]["identity"]:
+        raise ValueError("At least one candidate (the identity) is required.")
+    return candidates
+
+
+def apply_symmetry_candidate(
+    model: nn.Module,
+    candidate: Dict[str, Any],
+    args: Any,
+) -> None:
+    """Apply a generated candidate using the unchanged MNISTCIFAR APIs."""
+    if bool(getattr(args, "tele_att", 1)):
+        teleportation_att(model, candidate["M_att"], candidate["M_att_inv"], args.tele_layer)
+    if bool(getattr(args, "tele_mlp", 0)):
+        teleportation_mlp(model, candidate["M_mlp"], candidate["M_mlp_inv"])
+
+
+def mlp_weight_parameters(model: nn.Module) -> List[nn.Parameter]:
+    weights: List[nn.Parameter] = []
+    for block in model.vit.encoder.layer:
+        weights.append(block.intermediate.dense.weight)
+        weights.append(block.output.dense.weight)
+    return weights
+
+
+def teleportation_parameter_items(model: nn.Module, args: Any) -> List[Tuple[str, nn.Parameter]]:
+    """Parameters whose coordinate systems change under the selected transform."""
+    items: List[Tuple[str, nn.Parameter]] = []
+    if bool(getattr(args, "tele_att", 1)):
+        items.extend(qk_parameter_items(model, args.tele_layer))
+    if bool(getattr(args, "tele_mlp", 0)):
+        for i, block in enumerate(model.vit.encoder.layer):
+            prefix = f"vit.encoder.layer.{i}"
+            intermediate = block.intermediate.dense
+            output = block.output.dense
+            items.append((f"{prefix}.intermediate.dense.weight", intermediate.weight))
+            if intermediate.bias is not None:
+                items.append((f"{prefix}.intermediate.dense.bias", intermediate.bias))
+            items.append((f"{prefix}.output.dense.weight", output.weight))
+    # De-duplicate in case a future model shares a parameter in two modules.
+    unique: List[Tuple[str, nn.Parameter]] = []
+    seen = set()
+    for name, parameter in items:
+        if id(parameter) not in seen:
+            unique.append((name, parameter))
+            seen.add(id(parameter))
+    return unique
+
+
+def reset_teleportation_optimizer_state(model: nn.Module, optimizer: torch.optim.Optimizer, args: Any) -> None:
+    for _, parameter in teleportation_parameter_items(model, args):
+        optimizer.state.pop(parameter, None)
+
+
+def compute_symmetry_muon_alignment(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    args: Any,
+) -> float:
+    """Sum gradient/update alignment over all transformed Muon weight matrices."""
+    if bool(getattr(args, "tele_att", 1)) and not bool(getattr(args, "tele_mlp", 0)):
+        # Preserve compatibility with callers/tests that patch the existing Q/K
+        # scorer, as well as its exact Q/K-only semantics.
+        return compute_qk_muon_alignment(model, optimizer, batch, criterion, args.tele_layer)
+
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(pixel_values=batch[0]).logits
+    loss = criterion(logits, batch[1])
+    loss.backward()
+
+    if bool(getattr(args, "tele_att", 1)):
+        parameters = qk_weight_parameters(model, args.tele_layer)
+    else:
+        parameters = []
+    if bool(getattr(args, "tele_mlp", 0)):
+        parameters.extend(mlp_weight_parameters(model))
+
+    score = 0.0
+    seen = set()
+    for parameter in parameters:
+        if id(parameter) in seen or parameter.grad is None:
+            continue
+        seen.add(id(parameter))
+        group = parameter_group(optimizer, parameter)
+        if group is None or not group.get("use_muon", False):
+            continue
+        update = reset_muon_update(parameter.grad, momentum=group.get("momentum", 0.95))
+        grad = parameter.grad.detach().float().reshape_as(update)
+        score += float(group["lr"]) * float(torch.sum(grad * update.float()).item())
+    return score
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -546,13 +757,13 @@ def try_muon_alignment_teleportation(
     accepted = False
     model.train()
     try:
-        candidates = candidate_qk_scales(
-            dim=dim,
+        candidates = generate_symmetry_candidates(
+            model=model,
+            args=args,
             low=low,
             high=high,
             count=args.tele_candidates,
             seed=args.seed + step_index,
-            rope=rope,
         )
         shortlist_size = _resolve_alignment_shortlist(args, max(0, args.tele_candidates - 1))
         shortlisted_indices = set()
@@ -566,15 +777,22 @@ def try_muon_alignment_teleportation(
             identity = index == 0
             align_model, align_optimizer = clone_model_and_optimizer(model, optimizer)
             restore_rng_state(rng_state)
-            apply_qk_diagonal_transform(align_model, scale, args.tele_layer, rope, low, high)
-            alignment = compute_qk_muon_alignment(align_model, align_optimizer, batch, criterion, args.tele_layer)
+            apply_symmetry_candidate(align_model, scale, args)
+            alignment = compute_symmetry_muon_alignment(align_model, align_optimizer, batch, criterion, args)
             results.append(
                 {
                     "candidate_index": index,
                     "identity": identity,
-                    "scale": scale.detach().cpu().tolist(),
-                    "scale_min": float(scale.min()),
-                    "scale_max": float(scale.max()),
+                    # Kept for log/API compatibility; now reports coordinate
+                    # scale magnitudes implied by the full matrix transform.
+                    "scale": scale["scale_summary"],
+                    "scale_min": float(scale["scale_min"]),
+                    "scale_max": float(scale["scale_max"]),
+                    "attention_scale": scale["attention_scale_summary"],
+                    "mlp_scale": scale["mlp_scale_summary"],
+                    "transform_type": "mnistcifar_symmetry_preserving_matrix",
+                    "uses_attention": bool(getattr(args, "tele_att", 1)),
+                    "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
                     "alignment": float(alignment),
                     "alignment_rank": None,
                     "virtual_loss_evaluated": False,
@@ -596,13 +814,14 @@ def try_muon_alignment_teleportation(
                 restore_rng_state(rng_state)
                 step_model, step_optimizer = clone_model_and_optimizer(model, optimizer)
                 restore_rng_state(rng_state)
-                apply_qk_diagonal_transform(step_model, torch.tensor(check["scale"], dtype=torch.float32), args.tele_layer, rope, low, high)
-                reset_qk_optimizer_state(step_model, step_optimizer, args.tele_layer)
+                apply_symmetry_candidate(step_model, candidates[check["candidate_index"]], args)
+                reset_teleportation_optimizer_state(step_model, step_optimizer, args)
                 check["post_step_loss"] = float(virtual_optimizer_step(step_model, step_optimizer, batch, criterion))
                 check["virtual_loss_evaluated"] = True
                 check["searched"] = True
 
         restore_rng_state(rng_state)
+        model.train(was_training)
         assert_live_state_unchanged(model, optimizer, live_snapshot)
 
         non_identity_results = [item for item in results if not item["identity"] and item["virtual_loss_evaluated"]]
@@ -621,26 +840,25 @@ def try_muon_alignment_teleportation(
                 < identity_reset_loss - epsilon
         )
 
-        accepted = False
-        reason = "rejected"
-        if best_non_identity is not None and best_non_identity["post_step_loss"] < regular_loss - epsilon:
-            accepted = True
+        accepted = bool(beats_regular and beats_reset_only)
+        if accepted:
+            # Retain the existing reason string for telemetry compatibility.
             reason = "accepted_better_than_regular_muon"
-        elif identity_result["virtual_loss_evaluated"] and identity_result["post_step_loss"] < regular_loss - epsilon:
+        elif (
+            identity_result["virtual_loss_evaluated"]
+            and identity_reset_loss is not None
+            and identity_reset_loss <= regular_loss + epsilon
+            and (best_non_identity is None or not beats_reset_only)
+        ):
             reason = "reset_only"
-        else:
+        elif not beats_regular:
             reason = "rejected_did_not_beat_regular_muon"
+        else:
+            reason = "rejected_did_not_beat_reset_only"
 
         if accepted and best_non_identity is not None:
-            apply_qk_diagonal_transform(
-                model,
-                torch.tensor(best_non_identity["scale"], dtype=torch.float32),
-                args.tele_layer,
-                rope,
-                low,
-                high,
-            )
-            reset_qk_optimizer_state(model, optimizer, args.tele_layer)
+            apply_symmetry_candidate(model, candidates[best_non_identity["candidate_index"]], args)
+            reset_teleportation_optimizer_state(model, optimizer, args)
 
         if accepted and best_non_identity is not None:
             selected = best_non_identity
@@ -669,9 +887,14 @@ def try_muon_alignment_teleportation(
             "selected_scale": selected["scale"],
             "scale_min": selected["scale_min"],
             "scale_max": selected["scale_max"],
+            "selected_attention_scale": candidates[selected["candidate_index"]]["attention_scale_summary"],
+            "selected_mlp_scale": candidates[selected["candidate_index"]]["mlp_scale_summary"],
             "identity_rank": int(identity_result["alignment_rank"]),
             "state_reset": accepted,
             "tele_layer": args.tele_layer,
+            "transform_family": "mnistcifar_symmetry_preserving_matrix",
+            "uses_attention": bool(getattr(args, "tele_att", 1)),
+            "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
             "alignment_gain": alignment_gain,
             "post_loss_gain": post_loss_gain,
             "proposed_candidate_index": (best_non_identity["candidate_index"] if best_non_identity is not None else None),
