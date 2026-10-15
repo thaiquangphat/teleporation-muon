@@ -743,17 +743,29 @@ def try_muon_alignment_teleportation(
     args: Any,
     step_index: int,
 ) -> Tuple[bool, Dict[str, Any]]:
+    """Select and apply the symmetry candidate maximizing Muon alignment.
+
+    This path deliberately does not evaluate virtual post-update losses. Every
+    candidate is scored by S_t(g) = sum_j lr_j <G_j(g), O_j(g)>_F, where O_j
+    is computed by the repository's actual Muon update/orthogonalization code
+    with a fresh momentum buffer. The highest-scoring candidate is selected
+    directly, including the identity candidate.
+
+    Public signature and telemetry keys are retained for compatibility. Loss-
+    based telemetry fields are set to None because no such losses are computed.
+    """
     started = time.perf_counter()
     rng_state = capture_rng_state()
     live_snapshot = snapshot_live_state(model, optimizer)
     low, high = validate_bounds(args.tele_low, args.tele_high)
-    rope = args.position_embedding == "rope"
-    query = qk_linear_modules(model, args.tele_layer)[0][0]
-    dim = query.out_features
     if args.tele_candidates < 2:
-        raise ValueError("muon_alignment requires at least one non-identity candidate; --tele-candidates must be >= 2.")
+        raise ValueError(
+            "muon_alignment requires at least one non-identity candidate; "
+            "--tele-candidates must be >= 2."
+        )
 
     was_training = model.training
+    committed = False
     accepted = False
     model.train()
     try:
@@ -765,35 +777,37 @@ def try_muon_alignment_teleportation(
             count=args.tele_candidates,
             seed=args.seed + step_index,
         )
-        shortlist_size = _resolve_alignment_shortlist(args, max(0, args.tele_candidates - 1))
-        shortlisted_indices = set()
-
-        regular_model, regular_optimizer = clone_model_and_optimizer(model, optimizer)
-        restore_rng_state(rng_state)
-        regular_loss = virtual_optimizer_step(regular_model, regular_optimizer, batch, criterion)
 
         results: List[Dict[str, Any]] = []
-        for index, scale in enumerate(candidates):
-            identity = index == 0
+        for index, candidate in enumerate(candidates):
             align_model, align_optimizer = clone_model_and_optimizer(model, optimizer)
+            # Give every candidate the same stochastic starting point.
             restore_rng_state(rng_state)
-            apply_symmetry_candidate(align_model, scale, args)
-            alignment = compute_symmetry_muon_alignment(align_model, align_optimizer, batch, criterion, args)
+            apply_symmetry_candidate(align_model, candidate, args)
+            alignment = compute_symmetry_muon_alignment(
+                align_model, align_optimizer, batch, criterion, args
+            )
+            if not math.isfinite(float(alignment)):
+                raise ValueError(
+                    f"Non-finite Muon alignment score for candidate {index}: {alignment}."
+                )
+
             results.append(
                 {
                     "candidate_index": index,
-                    "identity": identity,
-                    # Kept for log/API compatibility; now reports coordinate
-                    # scale magnitudes implied by the full matrix transform.
-                    "scale": scale["scale_summary"],
-                    "scale_min": float(scale["scale_min"]),
-                    "scale_max": float(scale["scale_max"]),
-                    "attention_scale": scale["attention_scale_summary"],
-                    "mlp_scale": scale["mlp_scale_summary"],
+                    "identity": bool(candidate["identity"]),
+                    # Preserve the former telemetry schema while reporting the
+                    # coordinate scale magnitudes implied by the full matrices.
+                    "scale": candidate["scale_summary"],
+                    "scale_min": float(candidate["scale_min"]),
+                    "scale_max": float(candidate["scale_max"]),
+                    "attention_scale": candidate["attention_scale_summary"],
+                    "mlp_scale": candidate["mlp_scale_summary"],
                     "transform_type": "mnistcifar_symmetry_preserving_matrix",
                     "uses_attention": bool(getattr(args, "tele_att", 1)),
                     "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
                     "alignment": float(alignment),
+                    "alignment_evaluated": True,
                     "alignment_rank": None,
                     "virtual_loss_evaluated": False,
                     "post_step_loss": None,
@@ -801,114 +815,97 @@ def try_muon_alignment_teleportation(
                 }
             )
 
-        ranked = sorted(results, key=lambda item: float(item["alignment"]), reverse=True)
+        # Exact discrete argmax over the candidate set. The identity candidate
+        # participates in the same objective; in ties, the earlier candidate
+        # (identity first) wins deterministically.
+        ranked = sorted(
+            results,
+            key=lambda item: (-float(item["alignment"]), int(item["candidate_index"])),
+        )
         for rank, item in enumerate(ranked, start=1):
             item["alignment_rank"] = rank
-        shortlisted = [item for item in ranked if not item["identity"]][:shortlist_size]
-        for item in shortlisted:
-            shortlisted_indices.add(item["candidate_index"])
-
+        selected = ranked[0]
+        selected_index = int(selected["candidate_index"])
+        selected_candidate = candidates[selected_index]
         identity_result = next(item for item in results if item["identity"])
-        for check in [identity_result, *shortlisted]:
-            if check["candidate_index"] in shortlisted_indices or check["identity"]:
-                restore_rng_state(rng_state)
-                step_model, step_optimizer = clone_model_and_optimizer(model, optimizer)
-                restore_rng_state(rng_state)
-                apply_symmetry_candidate(step_model, candidates[check["candidate_index"]], args)
-                reset_teleportation_optimizer_state(step_model, step_optimizer, args)
-                check["post_step_loss"] = float(virtual_optimizer_step(step_model, step_optimizer, batch, criterion))
-                check["virtual_loss_evaluated"] = True
-                check["searched"] = True
+        non_identity_results = [item for item in results if not item["identity"]]
+        best_non_identity = max(
+            non_identity_results,
+            key=lambda item: float(item["alignment"]),
+        ) if non_identity_results else None
 
+        # Verify scoring was read-only before committing the selected transform.
         restore_rng_state(rng_state)
         model.train(was_training)
         assert_live_state_unchanged(model, optimizer, live_snapshot)
 
-        non_identity_results = [item for item in results if not item["identity"] and item["virtual_loss_evaluated"]]
-        best_non_identity = min(non_identity_results, key=lambda item: float(item["post_step_loss"])) if non_identity_results else None
-        epsilon = float(args.tele_accept_tol)
-
-        identity_reset_loss = identity_result["post_step_loss"]
-        beats_regular = (
-            best_non_identity is not None
-            and best_non_identity["post_step_loss"] < regular_loss - epsilon
-        )
-        beats_reset_only = (
-            best_non_identity is not None
-            and identity_reset_loss is not None
-            and best_non_identity["post_step_loss"]
-                < identity_reset_loss - epsilon
+        # Algorithm 8 resets the optimizer state for the parameter families in
+        # the selected symmetry. This also applies when identity wins: in that
+        # case parameters stay the same, but the reset-only branch is selected.
+        apply_symmetry_candidate(model, selected_candidate, args)
+        reset_teleportation_optimizer_state(model, optimizer, args)
+        committed = True
+        accepted = not bool(selected["identity"])
+        reason = (
+            "selected_max_alignment"
+            if accepted
+            else "identity_selected_max_alignment_state_reset"
         )
 
-        accepted = bool(beats_regular and beats_reset_only)
-        if accepted:
-            # Retain the existing reason string for telemetry compatibility.
-            reason = "accepted_better_than_regular_muon"
-        elif (
-            identity_result["virtual_loss_evaluated"]
-            and identity_reset_loss is not None
-            and identity_reset_loss <= regular_loss + epsilon
-            and (best_non_identity is None or not beats_reset_only)
-        ):
-            reason = "reset_only"
-        elif not beats_regular:
-            reason = "rejected_did_not_beat_regular_muon"
-        else:
-            reason = "rejected_did_not_beat_reset_only"
-
-        if accepted and best_non_identity is not None:
-            apply_symmetry_candidate(model, candidates[best_non_identity["candidate_index"]], args)
-            reset_teleportation_optimizer_state(model, optimizer, args)
-
-        if accepted and best_non_identity is not None:
-            selected = best_non_identity
-        else:
-            selected = best_non_identity if best_non_identity is not None else identity_result
-
-        post_loss_gain = float(regular_loss) - float(selected["post_step_loss"]) if selected["post_step_loss"] is not None else 0.0
-        alignment_gain = float(selected["alignment"]) - float(identity_result["alignment"]) if identity_result is not None else 0.0
+        identity_alignment = float(identity_result["alignment"])
+        selected_alignment = float(selected["alignment"])
+        alignment_gain = selected_alignment - identity_alignment
+        search_time = round(time.perf_counter() - started, 6)
 
         telemetry = {
             "method": "muon_alignment",
             "accepted": accepted,
             "reason": reason,
             "step": step_index,
-            "search_time_seconds": round(time.perf_counter() - started, 6),
-            "regular_muon_post_step_loss": float(regular_loss),
-            "identity_reset_loss": float(identity_result["post_step_loss"]),
-            "identity_alignment": float(identity_result["alignment"]),
-            "best_non_identity_candidate_loss": float(best_non_identity["post_step_loss"]) if best_non_identity is not None else None,
-            "beats_regular_baseline": beats_regular,
-            "beats_reset_only": beats_reset_only,
-            "accepted_beyond_reset_only": accepted and beats_reset_only,
-            "selected_alignment": float(selected["alignment"]),
-            "selected_post_step_loss": float(selected["post_step_loss"]) if selected["post_step_loss"] is not None else None,
+            "search_time_seconds": search_time,
+            # Kept for log/schema compatibility; these objectives are no longer
+            # evaluated by the alignment-only selection algorithm.
+            "regular_muon_post_step_loss": None,
+            "identity_reset_loss": None,
+            "identity_alignment": identity_alignment,
+            "best_non_identity_candidate_loss": None,
+            "beats_regular_baseline": None,
+            "beats_reset_only": None,
+            "accepted_beyond_reset_only": None,
+            "selected_alignment": selected_alignment,
+            "selected_post_step_loss": None,
             "selected_identity": bool(selected["identity"]),
+            "selected_candidate_index": selected_index,
             "selected_scale": selected["scale"],
             "scale_min": selected["scale_min"],
             "scale_max": selected["scale_max"],
-            "selected_attention_scale": candidates[selected["candidate_index"]]["attention_scale_summary"],
-            "selected_mlp_scale": candidates[selected["candidate_index"]]["mlp_scale_summary"],
+            "selected_attention_scale": selected_candidate["attention_scale_summary"],
+            "selected_mlp_scale": selected_candidate["mlp_scale_summary"],
             "identity_rank": int(identity_result["alignment_rank"]),
-            "state_reset": accepted,
+            "state_reset": True,
             "tele_layer": args.tele_layer,
             "transform_family": "mnistcifar_symmetry_preserving_matrix",
             "uses_attention": bool(getattr(args, "tele_att", 1)),
             "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
             "alignment_gain": alignment_gain,
-            "post_loss_gain": post_loss_gain,
-            "proposed_candidate_index": (best_non_identity["candidate_index"] if best_non_identity is not None else None),
-            "proposed_post_loss_gain": (regular_loss - best_non_identity["post_step_loss"] if best_non_identity is not None and best_non_identity["post_step_loss"] is not None else None),
-            "accepted_candidate_index": (best_non_identity["candidate_index"] if accepted and best_non_identity is not None else None),
-            "accepted_post_loss_gain": (regular_loss - best_non_identity["post_step_loss"] if accepted and best_non_identity is not None else None),
-            "shortlist_size": shortlist_size,
+            "post_loss_gain": None,
+            "proposed_candidate_index": (
+                int(best_non_identity["candidate_index"])
+                if best_non_identity is not None else None
+            ),
+            "proposed_post_loss_gain": None,
+            "accepted_candidate_index": selected_index if accepted else None,
+            "accepted_post_loss_gain": None,
+            # No loss-based shortlist remains; all candidates were scored.
+            "shortlist_size": None,
+            "num_candidates_evaluated": len(results),
             "results": results,
         }
         return accepted, telemetry
     finally:
         restore_rng_state(rng_state)
         model.train(was_training)
-        if not accepted:
+        if not committed:
             assert_live_state_unchanged(model, optimizer, live_snapshot)
 
 def try_teleportation(
