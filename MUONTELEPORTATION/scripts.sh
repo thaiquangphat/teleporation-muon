@@ -7,12 +7,12 @@ run_for_seeds() {
 }
 
 #CIFAR-100 No teleport Muon
-run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 10 \
+run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 100 \
   --batch-size 256 --epochs 50 --d-model 192 --intermediate-size 768 --num-heads 3 --position-embedding "rope" \
   --opt "muon" --lr 0.005 --momentum 0.9 --weight_decay 1e-5 --save_dir ./checkpoints/plain
 
 #CIFAR-100 Naive Teleport Muon
-run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 10 \
+run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 100 \
   --batch-size 256 --epochs 50 --d-model 192 --intermediate-size 768 --num-heads 3 --position-embedding "rope" \
   --opt "muon" --lr 0.005 --momentum 0.9 --weight_decay 1e-5 \
   --tele-method naive --tele-att 1 --tele-mlp 0 --tele-opt 1 --tele-sign 0 --tele-layer "all" \
@@ -20,7 +20,7 @@ run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 
   --save_dir ./checkpoints/naive
 
 #CIFAR-100 Muon-alignment Teleport
-run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 10 \
+run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 100 \
   --batch-size 256 --epochs 50 --d-model 192 --intermediate-size 768 --num-heads 3 --position-embedding "rope" \
   --opt "muon" --lr 0.005 --momentum 0.9 --weight_decay 1e-5 \
   --tele-method muon_alignment --tele-att 1 --tele-mlp 0 --tele-opt 1 --tele-sign 0 --tele-layer "all" \
