@@ -75,6 +75,8 @@ and mean best validation accuracy to `plots/`.
 
 The ImageNet loader expects the dataset to be organized as
 `<data-dir>/train/<class>/...` and `<data-dir>/val/<class>/...`, matching
-`IMAGENET/`. Set `IMAGENET_DATA_DIR` to the dataset root before running
-`scripts.sh`; it defaults to `./data/imagenet`. Images are cropped/resized to
-224 pixels and normalized with ImageNet mean and standard deviation.
+`IMAGENET/`. From `MUONTELEPORTATION/`, run `bash data.sh` once to download and
+prepare ImageNet-1K at `./data/imagenet`. The script accepts a destination as
+its first argument or through `IMAGENET_DATA_DIR`; use the same destination
+when running `scripts.sh`. Images are cropped/resized to 224 pixels and
+normalized with ImageNet mean and standard deviation.
