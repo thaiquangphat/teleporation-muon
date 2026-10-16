@@ -70,3 +70,11 @@ acceptance, data/model setup, checkpoint, training, and validation durations.
 Run `bash scripts.sh` to execute each configured experiment. After all runs
 complete, it fetches W&B history and writes plots of the per-epoch metric means
 and mean best validation accuracy to `plots/`.
+
+## ImageNet-1K
+
+The ImageNet loader expects the dataset to be organized as
+`<data-dir>/train/<class>/...` and `<data-dir>/val/<class>/...`, matching
+`IMAGENET/`. Set `IMAGENET_DATA_DIR` to the dataset root before running
+`scripts.sh`; it defaults to `./data/imagenet`. Images are cropped/resized to
+224 pixels and normalized with ImageNet mean and standard deviation.

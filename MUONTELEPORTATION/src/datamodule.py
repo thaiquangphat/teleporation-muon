@@ -1,5 +1,8 @@
+import os
+
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torchvision.transforms import InterpolationMode
 
 def get_dataset(args):
     if(args.dataset == 'CIFAR10'):
@@ -8,6 +11,8 @@ def get_dataset(args):
         return get_cifar100_dataloaders(args)
     elif(args.dataset == 'MNIST'):
         return get_mnist_dataloaders(args)
+    elif(args.dataset == 'IMAGENET'):
+        return get_imagenet_dataloaders(args)
     
 
 def get_mnist_dataloaders(args):
@@ -65,6 +70,50 @@ def get_cifar10_dataloaders(args):
         root=args.data_dir,
         train=False,
         download=True,
+        transform=val_transform,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    return train_loader, val_loader
+
+def get_imagenet_dataloaders(args):
+    mean = (0.485, 0.456, 0.406)
+    std = (0.229, 0.224, 0.225)
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(
+            args.img_size,
+            interpolation=InterpolationMode.BICUBIC,
+        ),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+    resize_size = int((256 / 224) * args.img_size)
+    val_transform = transforms.Compose([
+        transforms.Resize(resize_size, interpolation=InterpolationMode.BICUBIC),
+        transforms.CenterCrop(args.img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+    train_dataset = datasets.ImageFolder(
+        root=os.path.join(args.data_dir, "train"),
+        transform=train_transform,
+    )
+    val_dataset = datasets.ImageFolder(
+        root=os.path.join(args.data_dir, "val"),
         transform=val_transform,
     )
 

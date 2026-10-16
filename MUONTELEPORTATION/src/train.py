@@ -25,7 +25,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train ViT Teleportation")
 
     parser.add_argument("--data-dir", type=str, default="./data")
-    parser.add_argument("--dataset", type=str, choices=["CIFAR100", "CIFAR10", "MNIST"])
+    parser.add_argument("--dataset", type=str, choices=["CIFAR100", "CIFAR10", "MNIST", "IMAGENET"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
