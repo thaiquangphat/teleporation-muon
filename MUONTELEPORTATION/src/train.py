@@ -3,6 +3,8 @@ import os
 import time
 
 import torch
+import wandb
+import yaml
 from torch import nn
 from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -10,7 +12,6 @@ from tqdm import tqdm
 from transformers import ViTConfig, ViTForImageClassification
 
 from datamodule import get_dataset
-from logger import TrainingLogger
 from model import ViTRoPEForImageClassification
 from muon import create_muon_optimizer
 from teleport import generate_tele_scheduler, try_teleportation
@@ -29,6 +30,9 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-mode", type=str, choices=["online", "offline", "disabled"], default=None)
     parser.add_argument("--devices", type=str, default="cuda:0")
     parser.add_argument("--img-size", type=int, default=32)
     parser.add_argument("--padding", type=int, default=4)
@@ -122,8 +126,39 @@ def maybe_teleport(args):
     return args.tele_method != "none" or args.n_teleport > 0
 
 
+def synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def load_wandb_settings(args):
+    config_path = os.environ.get("WANDB_CONFIG_PATH", "./wandb.yaml")
+    file_config = {}
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as config_file:
+            file_config = yaml.safe_load(config_file) or {}
+        if not isinstance(file_config, dict):
+            raise ValueError(f"W&B config must be a YAML mapping: {config_path}")
+
+    project = args.wandb_project or os.environ.get("WANDB_PROJECT") or file_config.get("project")
+    entity = args.wandb_entity or os.environ.get("WANDB_ENTITY") or file_config.get("entity") or None
+    mode = args.wandb_mode or os.environ.get("WANDB_MODE") or file_config.get("mode") or "online"
+    api_key = os.environ.get("WANDB_API_KEY") or file_config.get("api_key")
+
+    if not project:
+        raise ValueError("Set project in wandb.yaml, WANDB_PROJECT, or --wandb-project.")
+    if mode not in {"online", "offline", "disabled"}:
+        raise ValueError("W&B mode must be online, offline, or disabled.")
+    if mode == "online" and not api_key:
+        raise ValueError("Set api_key in wandb.yaml or WANDB_API_KEY for online W&B.")
+    if api_key:
+        os.environ["WANDB_API_KEY"] = str(api_key)
+    return str(project), str(entity) if entity else None, str(mode)
+
+
 def main():
     args = parse_args()
+    run_started = time.perf_counter()
     if args.tele_method == "naive" and args.n_teleport <= 0:
         args.n_teleport = max(args.tele_candidates, 2)
 
@@ -133,11 +168,15 @@ def main():
     run_name = build_run_name(args)
     save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(save_dir, exist_ok=True)
-    print("Save directory: ", save_dir)
 
-    model = build_model(args, device)
+    setup_started = time.perf_counter()
+    data_started = time.perf_counter()
     train_loader, val_loader = get_dataset(args)
+    data_loading_time_seconds = time.perf_counter() - data_started
+    model_started = time.perf_counter()
+    model = build_model(args, device)
     optimizer = build_optimizer(model, args)
+    model_setup_time_seconds = time.perf_counter() - model_started
 
     if args.lr_scheduler == "cosine":
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -162,34 +201,81 @@ def main():
     best_acc = 0.0
     best_epoch = 0
     gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
-    logger = TrainingLogger(
-        save_dir=save_dir,
-        run_name=run_name,
+    project, entity, mode = load_wandb_settings(args)
+    with wandb.init(
+        project=project,
+        entity=entity,
+        name=run_name,
         config=vars(args),
-        environment={
-            "device": str(device),
-            "gpu_name": gpu_name,
-            "torch_version": torch.__version__,
-            "cuda_version": torch.version.cuda,
-        },
-        dataset={
-            "name": args.dataset,
-            "train_samples": len(train_loader.dataset),
-            "validation_samples": len(val_loader.dataset),
-            "train_batches_per_epoch": len(train_loader),
-            "validation_batches_per_epoch": len(val_loader),
-        },
-        model={
-            "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
-        },
-    )
-    logger.data["telemetry"] = []
-
-    with logger:
+        dir=save_dir,
+        mode=mode,
+        job_type="train",
+    ) as run:
+        run_started = time.perf_counter()
+        run.config.update(
+            {
+                "environment_device": str(device),
+                "environment_gpu_name": gpu_name or "cpu",
+                "environment_torch_version": torch.__version__,
+                "environment_cuda_version": torch.version.cuda or "none",
+                "dataset_train_samples": len(train_loader.dataset),
+                "dataset_validation_samples": len(val_loader.dataset),
+                "dataset_train_batches_per_epoch": len(train_loader),
+                "dataset_validation_batches_per_epoch": len(val_loader),
+                "model_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+            },
+            allow_val_change=True,
+        )
+        run.log(
+            {
+                "timing/data_loading_seconds": data_loading_time_seconds,
+                "timing/model_setup_seconds": model_setup_time_seconds,
+                "timing/initialization_seconds": time.perf_counter() - setup_started,
+            },
+        )
+        attempted_teleports = 0
+        accepted_teleports = 0
+        total_train_time_seconds = 0.0
+        total_validation_time_seconds = 0.0
+        total_checkpoint_time_seconds = 0.0
+        telemetry_table = wandb.Table(
+            columns=[
+                "epoch",
+                "batch",
+                "global_step",
+                "method",
+                "accepted",
+                "reason",
+                "search_time_seconds",
+                "alignment_gain",
+                "selected_alignment",
+                "selected_candidate_index",
+                "num_candidates_evaluated",
+            ]
+        )
+        candidate_table = wandb.Table(
+            columns=[
+                "epoch",
+                "batch",
+                "global_step",
+                "method",
+                "candidate_index",
+                "is_identity",
+                "alignment",
+                "alignment_rank",
+                "post_step_loss_evaluated",
+                "post_step_loss",
+            ]
+        )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         for epoch in range(1, args.epochs + 1):
+            synchronize_device(device)
             epoch_started = time.perf_counter()
             model.train()
             running_loss = 0.0
+            processed_batches = 0
+            processed_samples = 0
             for i, (images, labels) in enumerate(tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")):
                 if args.max_train_batches > 0 and i >= args.max_train_batches:
                     break
@@ -217,7 +303,46 @@ def main():
                     info["epoch"] = epoch
                     info["batch"] = i
                     info["accepted"] = accepted
-                    logger.data["telemetry"].append(info)
+                    attempted_teleports += 1
+                    accepted_teleports += int(accepted)
+                    telemetry_table.add_data(
+                        epoch,
+                        i,
+                        global_step,
+                        info.get("method", method),
+                        accepted,
+                        info.get("reason", ""),
+                        info.get("search_time_seconds", 0.0),
+                        info.get("alignment_gain"),
+                        info.get("selected_alignment"),
+                        info.get("selected_candidate_index"),
+                        info.get("num_candidates_evaluated"),
+                    )
+                    for candidate in info.get("results", []):
+                        candidate_table.add_data(
+                            epoch,
+                            i,
+                            global_step,
+                            info.get("method", method),
+                            candidate.get("candidate_index"),
+                            candidate.get("identity"),
+                            candidate.get("alignment"),
+                            candidate.get("alignment_rank"),
+                            candidate.get("post_step_loss") is not None,
+                            candidate.get("post_step_loss"),
+                        )
+                    event_metrics = {
+                        "teleport/attempted": attempted_teleports,
+                        "teleport/accepted": accepted_teleports,
+                        "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
+                        "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
+                        "teleport/alignment_gain": info.get("alignment_gain"),
+                        "teleport/selected_alignment": info.get("selected_alignment"),
+                        "teleport/selected_candidate_index": info.get("selected_candidate_index"),
+                        "teleport/num_candidates_evaluated": info.get("num_candidates_evaluated"),
+                        "teleport/accepted_event": int(accepted),
+                    }
+                    run.log({key: value for key, value in event_metrics.items() if value is not None})
 
                 outputs = model(pixel_values=images).logits
                 loss = criterion(outputs, labels)
@@ -226,13 +351,23 @@ def main():
                 optimizer.zero_grad()
                 running_loss += loss.item()
                 global_step += 1
+                processed_batches += 1
+                processed_samples += labels.size(0)
+                run.log(
+                    {
+                        "train/batch_loss": loss.item(),
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/batch_size": labels.size(0),
+                    }
+                )
 
+            synchronize_device(device)
             train_time_seconds = time.perf_counter() - epoch_started
-            denom = max(args.max_train_batches, 1) if args.max_train_batches > 0 else len(train_loader)
-            avg_loss = running_loss / denom
+            total_train_time_seconds += train_time_seconds
+            avg_loss = running_loss / max(processed_batches, 1)
             current_lr = optimizer.param_groups[0]["lr"]
-            print(f"Epoch {epoch}, Train Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
 
+            synchronize_device(device)
             validation_started = time.perf_counter()
             model.eval()
             correct, total = 0, 0
@@ -246,11 +381,13 @@ def main():
                     preds = outputs.argmax(dim=1)
                     correct += (preds == labels).sum().item()
                     total += labels.size(0)
+            synchronize_device(device)
             validation_time_seconds = time.perf_counter() - validation_started
+            total_validation_time_seconds += validation_time_seconds
             avg_val_acc = correct / total
             avg_val_loss = val_loss / len(val_loader)
-            print(f"Epoch {epoch}, Val Acc: {avg_val_acc * 100:.2f}%, Val Loss: {avg_val_loss:.4f}")
 
+            checkpoint_started = time.perf_counter()
             last_ckpt_path = os.path.join(save_dir, "last.pt")
             checkpoint = {
                 "model_state_dict": model.state_dict(),
@@ -267,30 +404,73 @@ def main():
                 best_epoch = epoch
                 best_ckpt_path = os.path.join(save_dir, "best.pt")
                 torch.save(checkpoint, best_ckpt_path)
+            checkpoint_time_seconds = time.perf_counter() - checkpoint_started
+            total_checkpoint_time_seconds += checkpoint_time_seconds
 
+            scheduler_started = time.perf_counter()
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(avg_val_acc)
             elif scheduler is not None:
                 scheduler.step()
+            scheduler_time_seconds = time.perf_counter() - scheduler_started
 
             epoch_time_seconds = time.perf_counter() - epoch_started
-            logger.log_epoch(
+            gpu_memory_allocated = (
+                torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                if device.type == "cuda" else 0.0
+            )
+            run.log(
                 {
                     "epoch": epoch,
-                    "train_loss": avg_loss,
-                    "val_loss": avg_val_loss,
-                    "val_acc": avg_val_acc,
-                    "lr": current_lr,
-                    "next_lr": optimizer.param_groups[0]["lr"],
-                    "train_time_seconds": round(train_time_seconds, 6),
-                    "validation_time_seconds": round(validation_time_seconds, 6),
-                    "epoch_time_seconds": round(epoch_time_seconds, 6),
+                    "train/epoch_loss": avg_loss,
+                    "train/learning_rate": current_lr,
+                    "train/batches": processed_batches,
+                    "train/samples": processed_samples,
+                    "train/samples_per_second": (
+                        processed_samples / train_time_seconds
+                        if train_time_seconds > 0 else 0.0
+                    ),
+                    "validation/loss": avg_val_loss,
+                    "validation/accuracy": avg_val_acc,
+                    "validation/correct": correct,
+                    "validation/samples": total,
+                    "validation/samples_per_second": (
+                        total / validation_time_seconds if validation_time_seconds > 0 else 0.0
+                    ),
+                    "best/validation_accuracy": best_acc,
+                    "best/epoch": best_epoch,
+                    "timing/train_seconds": train_time_seconds,
+                    "timing/validation_seconds": validation_time_seconds,
+                    "timing/evaluation_seconds": validation_time_seconds,
+                    "timing/checkpoint_seconds": checkpoint_time_seconds,
+                    "timing/scheduler_seconds": scheduler_time_seconds,
+                    "timing/epoch_seconds": epoch_time_seconds,
+                    "timing/total_training_seconds": total_train_time_seconds,
+                    "timing/total_validation_seconds": total_validation_time_seconds,
+                    "timing/total_evaluation_seconds": total_validation_time_seconds,
+                    "timing/total_checkpoint_seconds": total_checkpoint_time_seconds,
+                    "teleport/attempted": attempted_teleports,
+                    "teleport/accepted": accepted_teleports,
+                    "teleport/acceptance_rate": (
+                        accepted_teleports / attempted_teleports if attempted_teleports else 0.0
+                    ),
+                    "system/gpu_peak_memory_mb": gpu_memory_allocated,
                     "global_step": global_step,
-                },
-                best_val_acc=best_acc,
-                best_epoch=best_epoch,
+                }
             )
-    print(f"Training log: {logger.log_path}")
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+        run.log({"teleport/events": telemetry_table})
+        run.log({"teleport/candidates": candidate_table})
+        run.summary["best/validation_accuracy"] = best_acc
+        run.summary["best/epoch"] = best_epoch
+        run.summary["timing/total_training_seconds"] = total_train_time_seconds
+        run.summary["timing/total_validation_seconds"] = total_validation_time_seconds
+        run.summary["timing/total_evaluation_seconds"] = total_validation_time_seconds
+        run.summary["timing/total_checkpoint_seconds"] = total_checkpoint_time_seconds
+        run.summary["timing/run_seconds"] = time.perf_counter() - run_started
+        run.summary["teleport/attempted"] = attempted_teleports
+        run.summary["teleport/accepted"] = accepted_teleports
 
 
 if __name__ == "__main__":

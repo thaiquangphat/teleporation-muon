@@ -1,5 +1,8 @@
 set -e
 
+source ./wandb_config.sh
+load_wandb_config
+
 run_for_seeds() {
   for seed in 1; do
     python3 src/train.py --seed "$seed" "$@"
@@ -27,4 +30,4 @@ run_for_seeds --dataset "CIFAR100" --img-size 32 --num_channels 3 --num-classes 
   --tele-candidates 6 --tele-batch 4 --tele-cons 4 --tele-high 1.65 --tele-low 0.35 --tele-epoch-array 1,5 \
   --tele-accept-tol 1e-6 --save_dir ./checkpoints/muon_alignment
 
-python3 plot_results.py --results-dir ./checkpoints --output-dir ./plots
+python3 plot_results.py --project "$WANDB_PROJECT" --entity "$WANDB_ENTITY" --output-dir ./plots

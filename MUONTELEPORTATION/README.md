@@ -7,7 +7,16 @@ This folder reimplements the `MNISTCIFAR/` Vision Transformer and adds Muon-alig
 ```bash
 cd MUONTELEPORTATION
 python -m pip install -r requirements.txt
+cp wandb.yaml.example wandb.yaml
 ```
+
+Set `api_key`, `project`, and (optionally) `entity` in the ignored `wandb.yaml`.
+The shell scripts load this file and export the W&B environment variables; secrets
+are not stored in the scripts or sent as run configuration. Set `mode` to `offline`
+or `disabled` when running without an online W&B account.
+For `modal_app.py`, provide a Modal secret named `wandb` containing
+`WANDB_API_KEY` and `WANDB_PROJECT` (and optionally `WANDB_ENTITY`); the local
+YAML file is excluded from the uploaded project files.
 
 ## Tests
 
@@ -53,6 +62,11 @@ python src/train.py --seed 3 --dataset MNIST --img-size 28 --num_channels 1 --nu
 bash script_test.sh
 ```
 
-Each run writes `log.json`, `last.pt`, and `best.pt` under `checkpoints/<run_name>/`. Teleport decisions are stored in `log.json` under `telemetry`.
+Each run writes W&B metrics and a teleport-event table, plus `last.pt` and
+`best.pt` under `checkpoints/<run_name>/`. Metrics include batch and epoch loss,
+validation accuracy/loss, learning rates, throughput, teleport attempts and
+acceptance, data/model setup, checkpoint, training, and validation durations.
 
-Run `bash scripts.sh` to execute each configured experiment with seeds 1, 2, and 3. After all runs complete, it writes plots of the per-epoch metric means and mean best validation accuracy to `plots/`.
+Run `bash scripts.sh` to execute each configured experiment. After all runs
+complete, it fetches W&B history and writes plots of the per-epoch metric means
+and mean best validation accuracy to `plots/`.

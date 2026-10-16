@@ -1,32 +1,52 @@
 import argparse
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean
 
 import matplotlib
+import wandb
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def load_runs(results_dir: Path) -> list[dict]:
-    runs = []
-    for log_path in sorted(results_dir.rglob("log.json")):
-        with log_path.open(encoding="utf-8") as log_file:
-            log = json.load(log_file)
+def load_runs(project: str, entity: str | None = None) -> list[dict]:
+    api = wandb.Api()
+    entity = entity or api.default_entity
+    if not entity:
+        raise RuntimeError("Set WANDB_ENTITY or configure a default W&B entity.")
 
-        epochs = log.get("epochs", [])
+    runs = []
+    for run in api.runs(f"{entity}/{project}"):
+        config = dict(run.config)
+        history_keys = [
+            "epoch",
+            "train/epoch_loss",
+            "validation/loss",
+            "validation/accuracy",
+        ]
+        epochs = [
+            {
+                "epoch": int(row["epoch"]),
+                "train_loss": row["train/epoch_loss"],
+                "val_loss": row["validation/loss"],
+                "val_acc": row["validation/accuracy"],
+            }
+            for row in run.scan_history(keys=history_keys)
+            if row.get("epoch") is not None
+            and row.get("train/epoch_loss") is not None
+            and row.get("validation/loss") is not None
+            and row.get("validation/accuracy") is not None
+        ]
         if not epochs:
             continue
 
-        config = log.get("config", {})
-        dataset = config.get("dataset") or log.get("dataset", {}).get("name")
+        dataset = config.get("dataset")
         if not dataset:
-            print(f"Skipping log without dataset metadata: {log_path}")
             continue
-        if log.get("status") not in (None, "completed"):
-            print(f"Skipping incomplete run log: {log_path}")
+        if run.state != "finished":
             continue
 
         method = config.get("tele_method", "unknown")
@@ -34,7 +54,7 @@ def load_runs(results_dir: Path) -> list[dict]:
         optimizer = config.get("opt", "unknown")
         runs.append(
             {
-                "path": log_path,
+                "path": run.url,
                 "dataset": dataset,
                 "method": method,
                 "state_mode": state_mode,
@@ -42,7 +62,7 @@ def load_runs(results_dir: Path) -> list[dict]:
                 "config": config,
                 "seed": config.get("seed"),
                 "epochs": epochs,
-                "best_val_acc": log.get("best_val_acc"),
+                "best_val_acc": run.summary.get("best/validation_accuracy"),
             }
         )
     return runs
@@ -163,15 +183,18 @@ def plot_best_accuracy(runs: list[dict], output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot mean validation accuracy and loss from MUONTELEPORTATION run logs."
+        description="Plot mean validation accuracy and loss from W&B experiment runs."
     )
-    parser.add_argument("--results-dir", type=Path, required=True)
+    parser.add_argument("--project", default=os.environ.get("WANDB_PROJECT"))
+    parser.add_argument("--entity", default=os.environ.get("WANDB_ENTITY"))
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
+    if not args.project:
+        raise RuntimeError("Set WANDB_PROJECT or pass --project.")
 
-    runs = average_runs(load_runs(args.results_dir))
+    runs = average_runs(load_runs(args.project, args.entity))
     if not runs:
-        raise RuntimeError(f"No completed epoch logs found under {args.results_dir}")
+        raise RuntimeError(f"No completed epoch logs found in W&B project {args.project}.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for dataset in sorted({run["dataset"] for run in runs}):

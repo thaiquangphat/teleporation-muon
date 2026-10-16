@@ -6,3 +6,5 @@ tqdm>=4.9.0
 matplotlib>=3.8.0
 numpy
 typing_extensions
+wandb>=0.17.0
+PyYAML>=6.0.0
