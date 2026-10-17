@@ -28,7 +28,7 @@ import torch
 
 def _zeropower_via_newtonschulz5(gradient, steps=5):
     a, b, c = 3.4445, -4.7750, 2.0315
-    update = gradient.to(torch.bfloat16)
+    update = gradient.float()
     transposed = update.size(-2) > update.size(-1)
     if transposed:
         update = update.mT

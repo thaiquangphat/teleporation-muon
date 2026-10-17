@@ -170,11 +170,12 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     setup_started = time.perf_counter()
+    model_started = time.perf_counter()
+    model = build_model(args, device)
+    model_setup_time_seconds = time.perf_counter() - model_started
     data_started = time.perf_counter()
     train_loader, val_loader = get_dataset(args)
     data_loading_time_seconds = time.perf_counter() - data_started
-    model_started = time.perf_counter()
-    model = build_model(args, device)
     optimizer = build_optimizer(model, args)
     model_setup_time_seconds = time.perf_counter() - model_started
 
