@@ -486,6 +486,83 @@ def reset_teleportation_optimizer_state(model: nn.Module, optimizer: torch.optim
         optimizer.state.pop(parameter, None)
 
 
+def _transform_momentum_left(
+    optimizer: torch.optim.Optimizer,
+    parameter: nn.Parameter,
+    transform: torch.Tensor,
+) -> None:
+    """Transport a Muon momentum buffer under a left-multiplied weight transform."""
+    state = optimizer.state.get(parameter)
+    if not state:
+        return
+    momentum = state.get("momentum_buffer")
+    if not torch.is_tensor(momentum):
+        return
+    matrix = transform.to(device=momentum.device, dtype=momentum.dtype)
+    with torch.no_grad():
+        momentum.copy_(matrix @ momentum)
+
+
+def _transform_momentum_right(
+    optimizer: torch.optim.Optimizer,
+    parameter: nn.Parameter,
+    transform: torch.Tensor,
+) -> None:
+    """Transport a Muon momentum buffer under a right-multiplied weight transform."""
+    state = optimizer.state.get(parameter)
+    if not state:
+        return
+    momentum = state.get("momentum_buffer")
+    if not torch.is_tensor(momentum):
+        return
+    matrix = transform.to(device=momentum.device, dtype=momentum.dtype)
+    with torch.no_grad():
+        momentum.copy_(momentum @ matrix)
+
+
+def transport_teleportation_optimizer_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    candidate: Dict[str, Any],
+    args: Any,
+) -> None:
+    """Transport Muon momentum through a symmetry, resetting only transformed Adam states.
+
+    For Q/K, W_Q' = M W_Q and W_K' = M^{-T} W_K, so their gradient-like
+    momentum buffers transform as M^{-T} B_Q and M B_K. For the MLP symmetry,
+    W_1' = M W_1 and W_2' = W_2 M^{-1}, giving M^{-T} B_1 and B_2 M^T.
+
+    Adam's elementwise second-moment estimates cannot in general be transported
+    exactly through these coordinate changes. The states for transformed biases
+    (which use the auxiliary Adam group) are therefore cleared, while the Muon
+    weight momentum buffers are preserved in the new coordinates.
+    """
+    if bool(candidate.get("identity", False)):
+        return
+
+    if bool(getattr(args, "tele_att", 1)):
+        matrix = candidate["M_att"]
+        matrix_inv = candidate["M_att_inv"]
+        for query, key in qk_linear_modules(model, args.tele_layer):
+            _transform_momentum_left(optimizer, query.weight, matrix_inv.mT)
+            _transform_momentum_left(optimizer, key.weight, matrix)
+            if query.bias is not None:
+                optimizer.state.pop(query.bias, None)
+            if key.bias is not None:
+                optimizer.state.pop(key.bias, None)
+
+    if bool(getattr(args, "tele_mlp", 0)):
+        matrix = candidate["M_mlp"]
+        matrix_inv = candidate["M_mlp_inv"]
+        for block in model.vit.encoder.layer:
+            intermediate = block.intermediate.dense
+            output = block.output.dense
+            _transform_momentum_left(optimizer, intermediate.weight, matrix_inv.mT)
+            _transform_momentum_right(optimizer, output.weight, matrix.mT)
+            if intermediate.bias is not None:
+                optimizer.state.pop(intermediate.bias, None)
+
+
 def compute_symmetry_muon_alignment(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -493,37 +570,35 @@ def compute_symmetry_muon_alignment(
     criterion: nn.Module,
     args: Any,
 ) -> float:
-    """Sum gradient/update alignment over all transformed Muon weight matrices."""
-    if bool(getattr(args, "tele_att", 1)) and not bool(getattr(args, "tele_mlp", 0)):
-        # Preserve compatibility with callers/tests that patch the existing Q/K
-        # scorer, as well as its exact Q/K-only semantics.
-        return compute_qk_muon_alignment(model, optimizer, batch, criterion, args.tele_layer)
+    """Estimate one-step loss decrease using the candidate's actual optimizer state.
 
+    The historical function name and signature are retained for compatibility.
+    The returned value is now J = -<grad, parameter displacement>, computed by
+    taking one step on the isolated candidate clone and never evaluating a
+    post-step loss. A larger value predicts a larger first-order loss decrease.
+    """
     optimizer.zero_grad(set_to_none=True)
     logits = model(pixel_values=batch[0]).logits
     loss = criterion(logits, batch[1])
     loss.backward()
 
-    if bool(getattr(args, "tele_att", 1)):
-        parameters = qk_weight_parameters(model, args.tele_layer)
-    else:
-        parameters = []
-    if bool(getattr(args, "tele_mlp", 0)):
-        parameters.extend(mlp_weight_parameters(model))
+    # Snapshot parameters only after gradients are available and immediately
+    # before the exact optimizer step that the real training loop would take.
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    optimizer.step()
 
-    score = 0.0
-    seen = set()
-    for parameter in parameters:
-        if id(parameter) in seen or parameter.grad is None:
+    predicted_decrease = 0.0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None or name not in before:
             continue
-        seen.add(id(parameter))
-        group = parameter_group(optimizer, parameter)
-        if group is None or not group.get("use_muon", False):
-            continue
-        update = reset_muon_update(parameter.grad, momentum=group.get("momentum", 0.95))
-        grad = parameter.grad.detach().float().reshape_as(update)
-        score += float(group["lr"]) * float(torch.sum(grad * update.float()).item())
-    return score
+        displacement = parameter.detach().float() - before[name].float()
+        gradient = parameter.grad.detach().float()
+        predicted_decrease -= float(torch.sum(gradient * displacement).item())
+    return predicted_decrease
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -743,16 +818,17 @@ def try_muon_alignment_teleportation(
     args: Any,
     step_index: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Select and apply the symmetry candidate maximizing Muon alignment.
+    """Select a symmetry using predicted first-order decrease under the real optimizer.
 
-    This path deliberately does not evaluate virtual post-update losses. Every
-    candidate is scored by S_t(g) = sum_j lr_j <G_j(g), O_j(g)>_F, where O_j
-    is computed by the repository's actual Muon update/orthogonalization code
-    with a fresh momentum buffer. The highest-scoring candidate is selected
-    directly, including the identity candidate.
+    Each candidate is evaluated on a cloned model/optimizer. Existing Muon
+    momentum is transported through non-identity symmetries; transformed Adam
+    bias states are cleared because their elementwise second moments cannot be
+    transported exactly. One cloned optimizer step gives the actual proposed
+    displacement, and the score is -<gradient, displacement>. No post-step loss
+    or validation-loss check is performed.
 
-    Public signature and telemetry keys are retained for compatibility. Loss-
-    based telemetry fields are set to None because no such losses are computed.
+    Public signature and telemetry keys remain compatible with train.py; the
+    legacy `alignment` fields now carry the new objective's values.
     """
     started = time.perf_counter()
     rng_state = capture_rng_state()
@@ -783,21 +859,26 @@ def try_muon_alignment_teleportation(
             align_model, align_optimizer = clone_model_and_optimizer(model, optimizer)
             # Give every candidate the same stochastic starting point.
             restore_rng_state(rng_state)
-            apply_symmetry_candidate(align_model, candidate, args)
-            alignment = compute_symmetry_muon_alignment(
+            if not bool(candidate["identity"]):
+                apply_symmetry_candidate(align_model, candidate, args)
+                transport_teleportation_optimizer_state(
+                    align_model, align_optimizer, candidate, args
+                )
+            predicted_decrease = compute_symmetry_muon_alignment(
                 align_model, align_optimizer, batch, criterion, args
             )
-            if not math.isfinite(float(alignment)):
+            if not math.isfinite(float(predicted_decrease)):
                 raise ValueError(
-                    f"Non-finite Muon alignment score for candidate {index}: {alignment}."
+                    "Non-finite predicted first-order decrease for candidate "
+                    f"{index}: {predicted_decrease}."
                 )
 
             results.append(
                 {
                     "candidate_index": index,
                     "identity": bool(candidate["identity"]),
-                    # Preserve the former telemetry schema while reporting the
-                    # coordinate scale magnitudes implied by the full matrices.
+                    # Keep `alignment` as a compatibility alias for train.py and
+                    # existing W&B tables; its value now records this objective.
                     "scale": candidate["scale_summary"],
                     "scale_min": float(candidate["scale_min"]),
                     "scale_max": float(candidate["scale_max"]),
@@ -806,8 +887,11 @@ def try_muon_alignment_teleportation(
                     "transform_type": "mnistcifar_symmetry_preserving_matrix",
                     "uses_attention": bool(getattr(args, "tele_att", 1)),
                     "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
-                    "alignment": float(alignment),
+                    "alignment": float(predicted_decrease),
+                    # Retained as True so existing telemetry consumers keep their schema.
                     "alignment_evaluated": True,
+                    "predicted_first_order_decrease": float(predicted_decrease),
+                    "predicted_decrease_evaluated": True,
                     "alignment_rank": None,
                     "virtual_loss_evaluated": False,
                     "post_step_loss": None,
@@ -839,18 +923,21 @@ def try_muon_alignment_teleportation(
         model.train(was_training)
         assert_live_state_unchanged(model, optimizer, live_snapshot)
 
-        # Algorithm 8 resets the optimizer state for the parameter families in
-        # the selected symmetry. This also applies when identity wins: in that
-        # case parameters stay the same, but the reset-only branch is selected.
-        apply_symmetry_candidate(model, selected_candidate, args)
-        reset_teleportation_optimizer_state(model, optimizer, args)
-        committed = True
+        # Identity is the true plain-optimizer reference: leave both the model
+        # and every optimizer state untouched when it wins. For a real symmetry,
+        # transport Muon momentum and clear only transformed auxiliary Adam state.
         accepted = not bool(selected["identity"])
-        reason = (
-            "selected_max_alignment"
-            if accepted
-            else "identity_selected_max_alignment_state_reset"
-        )
+        state_reset = False
+        if accepted:
+            apply_symmetry_candidate(model, selected_candidate, args)
+            transport_teleportation_optimizer_state(
+                model, optimizer, selected_candidate, args
+            )
+            committed = True
+            state_reset = True  # transformed bias Adam states are reset when present
+            reason = "selected_max_predicted_decrease"
+        else:
+            reason = "identity_selected_max_predicted_decrease_noop"
 
         identity_alignment = float(identity_result["alignment"])
         selected_alignment = float(selected["alignment"])
@@ -882,7 +969,11 @@ def try_muon_alignment_teleportation(
             "selected_attention_scale": selected_candidate["attention_scale_summary"],
             "selected_mlp_scale": selected_candidate["mlp_scale_summary"],
             "identity_rank": int(identity_result["alignment_rank"]),
-            "state_reset": True,
+            "state_reset": state_reset,
+            "momentum_state_transported": accepted,
+            "selection_objective": "predicted_first_order_decrease",
+            "identity_predicted_first_order_decrease": identity_alignment,
+            "selected_predicted_first_order_decrease": selected_alignment,
             "tele_layer": args.tele_layer,
             "transform_family": "mnistcifar_symmetry_preserving_matrix",
             "uses_attention": bool(getattr(args, "tele_att", 1)),
