@@ -563,6 +563,39 @@ def transport_teleportation_optimizer_state(
                 optimizer.state.pop(intermediate.bias, None)
 
 
+def _paper_linearization_direction(
+    parameter: nn.Parameter,
+    optimizer: torch.optim.Optimizer,
+) -> Optional[torch.Tensor]:
+    """Return the current optimizer's momentum estimate for the paper's model.
+
+    The paper linearizes the loss with its momentum estimate m_t, rather than
+    replacing m_t by the instantaneous gradient g_t. For this hybrid Muon/Adam
+    optimizer, that means the updated Muon momentum buffer for Muon parameters
+    and Adam's updated first moment for Adam-managed parameters. For compatible
+    optimizers without an initialized momentum state, fall back to the gradient.
+    """
+    group = None
+    for candidate_group in optimizer.param_groups:
+        if any(p is parameter for p in candidate_group["params"]):
+            group = candidate_group
+            break
+
+    state = optimizer.state.get(parameter, {})
+    if group is not None and bool(group.get("use_muon", False)):
+        direction = state.get("momentum_buffer")
+    elif torch.is_tensor(state.get("exp_avg")):
+        direction = state.get("exp_avg")
+    elif torch.is_tensor(state.get("momentum_buffer")):
+        direction = state.get("momentum_buffer")
+    else:
+        direction = parameter.grad
+
+    if not torch.is_tensor(direction):
+        return parameter.grad
+    return direction
+
+
 def compute_symmetry_muon_alignment(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -570,20 +603,26 @@ def compute_symmetry_muon_alignment(
     criterion: nn.Module,
     args: Any,
 ) -> float:
-    """Estimate one-step loss decrease using the candidate's actual optimizer state.
+    """Score one virtual optimizer step using the paper's momentum model.
 
-    The historical function name and signature are retained for compatibility.
-    The returned value is now J = -<grad, parameter displacement>, computed by
-    taking one step on the isolated candidate clone and never evaluating a
-    post-step loss. A larger value predicts a larger first-order loss decrease.
+    The paper's steepest-descent formulation minimizes the linear model
+        F(theta) + <m_t, theta_next - theta>,
+    where m_t is the optimizer's momentum estimate. Accordingly this function
+    returns J = -<m_t, delta_theta> after executing one exact virtual optimizer
+    step on the isolated candidate clone. Muon-managed parameters use the
+    updated EMA momentum buffer; Adam-managed parameters use the updated first
+    moment. The instantaneous gradient is only a fallback for optimizers or
+    states that do not expose a momentum estimate.
+
+    Public name, arguments, and float return type are preserved for train.py.
+    No post-step loss is evaluated, and no live training state is modified.
     """
     optimizer.zero_grad(set_to_none=True)
     logits = model(pixel_values=batch[0]).logits
     loss = criterion(logits, batch[1])
     loss.backward()
 
-    # Snapshot parameters only after gradients are available and immediately
-    # before the exact optimizer step that the real training loop would take.
+    # Snapshot only parameters that actually participate in this optimizer step.
     before = {
         name: parameter.detach().clone()
         for name, parameter in model.named_parameters()
@@ -591,14 +630,19 @@ def compute_symmetry_muon_alignment(
     }
     optimizer.step()
 
-    predicted_decrease = 0.0
+    # The paper's linear model uses the optimizer momentum estimate m_t, not
+    # the raw minibatch gradient. Evaluate it against the actual proposed step.
+    momentum_linearized_decrease = 0.0
     for name, parameter in model.named_parameters():
         if parameter.grad is None or name not in before:
             continue
         displacement = parameter.detach().float() - before[name].float()
-        gradient = parameter.grad.detach().float()
-        predicted_decrease -= float(torch.sum(gradient * displacement).item())
-    return predicted_decrease
+        momentum = _paper_linearization_direction(parameter, optimizer)
+        if momentum is None:
+            continue
+        momentum = momentum.detach().float()
+        momentum_linearized_decrease -= float(torch.sum(momentum * displacement).item())
+    return momentum_linearized_decrease
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -877,8 +921,9 @@ def try_muon_alignment_teleportation(
                 {
                     "candidate_index": index,
                     "identity": bool(candidate["identity"]),
-                    # Keep `alignment` as a compatibility alias for train.py and
-                    # existing W&B tables; its value now records this objective.
+                    # Keep legacy field names for train.py/W&B compatibility.
+                    # These values now denote the paper-style momentum model
+                    # score, not a measured post-step loss decrease.
                     "scale": candidate["scale_summary"],
                     "scale_min": float(candidate["scale_min"]),
                     "scale_max": float(candidate["scale_max"]),
@@ -888,8 +933,11 @@ def try_muon_alignment_teleportation(
                     "uses_attention": bool(getattr(args, "tele_att", 1)),
                     "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
                     "alignment": float(predicted_decrease),
+                    "paper_momentum_linearized_decrease": float(predicted_decrease),
                     # Retained as True so existing telemetry consumers keep their schema.
                     "alignment_evaluated": True,
+                    # Legacy aliases retained for API/log compatibility; read
+                    # these as the momentum-linearized score defined above.
                     "predicted_first_order_decrease": float(predicted_decrease),
                     "predicted_decrease_evaluated": True,
                     "alignment_rank": None,
@@ -955,11 +1003,13 @@ def try_muon_alignment_teleportation(
             "regular_muon_post_step_loss": None,
             "identity_reset_loss": None,
             "identity_alignment": identity_alignment,
+            "identity_paper_momentum_linearized_decrease": identity_alignment,
             "best_non_identity_candidate_loss": None,
             "beats_regular_baseline": None,
             "beats_reset_only": None,
             "accepted_beyond_reset_only": None,
             "selected_alignment": selected_alignment,
+            "selected_paper_momentum_linearized_decrease": selected_alignment,
             "selected_post_step_loss": None,
             "selected_identity": bool(selected["identity"]),
             "selected_candidate_index": selected_index,
@@ -971,7 +1021,10 @@ def try_muon_alignment_teleportation(
             "identity_rank": int(identity_result["alignment_rank"]),
             "state_reset": state_reset,
             "momentum_state_transported": accepted,
-            "selection_objective": "predicted_first_order_decrease",
+            "selection_objective": "paper_momentum_linearized_decrease",
+            "paper_objective_definition": "-inner_product(updated_optimizer_momentum, virtual_parameter_displacement)",
+            # Legacy metric names retained; values are momentum-linearized
+            # scores rather than predictions formed with the instantaneous grad.
             "identity_predicted_first_order_decrease": identity_alignment,
             "selected_predicted_first_order_decrease": selected_alignment,
             "tele_layer": args.tele_layer,

@@ -158,6 +158,11 @@ def load_wandb_settings(args):
 
 def main():
     args = parse_args()
+
+    # Diagnostic A/B test: disable cuDNN TF32 only.
+    # Keep the attention implementation and all training/teleportation settings unchanged.
+    torch.backends.cudnn.allow_tf32 = False
+
     run_started = time.perf_counter()
     if args.tele_method == "naive" and args.n_teleport <= 0:
         args.n_teleport = max(args.tele_candidates, 2)
@@ -172,6 +177,20 @@ def main():
     setup_started = time.perf_counter()
     model_started = time.perf_counter()
     model = build_model(args, device)
+
+    # Record the effective numerical settings for cross-GPU comparisons.
+    print("\n========== NUMERICAL CONFIGURATION ==========")
+    print("Device:", device)
+    print("GPU:", torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU")
+    if device.type == "cuda":
+        print("GPU capability:", torch.cuda.get_device_capability(device))
+    print("Model dtype:", next(model.parameters()).dtype)
+    print("Attention implementation:", getattr(model.config, "_attn_implementation", "unknown"))
+    print("TF32 matmul:", torch.backends.cuda.matmul.allow_tf32)
+    print("TF32 cuDNN:", torch.backends.cudnn.allow_tf32)
+    print("Float32 matmul precision:", torch.get_float32_matmul_precision())
+    print("==============================================\n")
+
     model_setup_time_seconds = time.perf_counter() - model_started
     data_started = time.perf_counter()
     train_loader, val_loader = get_dataset(args)
