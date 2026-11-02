@@ -161,7 +161,9 @@ def main():
 
     # Diagnostic A/B test: disable cuDNN TF32 only.
     # Keep the attention implementation and all training/teleportation settings unchanged.
-    torch.backends.cudnn.allow_tf32 = False
+    # torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.allow_tf32 = True
 
     run_started = time.perf_counter()
     if args.tele_method == "naive" and args.n_teleport <= 0:

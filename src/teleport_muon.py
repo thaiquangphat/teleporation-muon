@@ -1,18 +1,18 @@
-"""Momo-Muon-only teleportation implementation.
+"""CSD-based Muon teleportation implementation.
 
-This module is deliberately separate from ``teleport.py``.  It implements
-only the symmetry-search path selected by ``--tele-method muon_alignment``;
-it does not contain or call the naive teleportation algorithm.
+This module is deliberately separate from ``teleport.py``. It implements the
+symmetry-search path selected by the existing ``--tele-method muon_alignment``
+CLI option, while keeping that public interface unchanged.
 
-The Momo scalar model is advanced on every minibatch by
-``update_momo_for_step`` (called by ``train-muon.py``). At a teleportation
-minibatch, candidate evaluation advances it once and schedules the selected
-Momo learning-rate scale for the normal optimizer.step() that follows.
+At scheduled teleportation minibatches, candidates are ranked by a constrained
+steepest-descent (CSD) linearized-decrease score. An accepted non-identity
+symmetry is committed and the following optimizer step is the repository's
+ordinary Muon step at its unmodified learning rate. No Momo scalar model,
+model truncation, or adaptive learning-rate multiplier is used.
 
-The underlying repository Muon direction (including its momentum/Nesterov
-and Newton-Schulz implementation) is retained. Momo supplies the scalar
-model, dual-norm score, and adaptive radius; this is a Momo-controlled
-adaptation of the existing Muon optimizer, not a replacement of muon.py.
+All non-scheduled minibatches use the unmodified Muon/Adam optimizer. The CSD
+score uses the same Nesterov momentum direction that the repository's Muon
+implementation passes to its Newton--Schulz polar-factor approximation.
 """
 
 import copy
@@ -407,12 +407,12 @@ def transport_teleportation_optimizer_state(
                 optimizer.state.pop(intermediate.bias, None)
 
 
-def _momo_muon_groups(optimizer: torch.optim.Optimizer) -> List[dict]:
-    """Return Muon parameter groups and validate the momentum convention."""
+def _muon_groups(optimizer: torch.optim.Optimizer) -> List[dict]:
+    """Return Muon parameter groups and validate their momentum convention."""
     groups = [group for group in optimizer.param_groups if bool(group.get("use_muon", False))]
     if not groups:
         raise ValueError(
-            "Momo-Muon teleportation requires at least one optimizer group with use_muon=True."
+            "CSD-Muon teleportation requires at least one optimizer group with use_muon=True."
         )
 
     betas = [float(group.get("momentum", 0.95)) for group in groups]
@@ -421,7 +421,7 @@ def _momo_muon_groups(optimizer: torch.optim.Optimizer) -> List[dict]:
         raise ValueError(f"Muon momentum must lie in [0, 1); got {beta}.")
     if any(abs(value - beta) > 1e-12 for value in betas[1:]):
         raise ValueError(
-            "The current Momo scalar model requires a common momentum coefficient "
+            "CSD candidate scoring requires a common momentum coefficient "
             "across Muon parameter groups."
         )
     for group in groups:
@@ -431,7 +431,7 @@ def _momo_muon_groups(optimizer: torch.optim.Optimizer) -> List[dict]:
     return groups
 
 
-def _momo_matrix_view(tensor: torch.Tensor) -> torch.Tensor:
+def _muon_matrix_view(tensor: torch.Tensor) -> torch.Tensor:
     """Use the matrix view used by Muon for nuclear-norm calculations."""
     value = tensor.detach().float()
     if value.ndim == 2:
@@ -446,44 +446,47 @@ def _momo_matrix_view(tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _momo_metrics_from_loss(
+def _csd_metrics_from_loss(
     optimizer: torch.optim.Optimizer,
     loss: torch.Tensor,
     args: Any,
     step_index: Optional[int] = None,
 ) -> Dict[str, float]:
-    """Compute the Momo model and constrained Muon step from current gradients.
+    """Compute the candidate's CSD linearized-decrease score.
 
-    This predicts the EMA buffer that the repository's Muon optimizer will
-    produce at its next step:
-        M_t = beta M_{t-1} + (1-beta) G_t.
+    For each Muon matrix parameter, predict the repository momentum buffer
 
-    It does not mutate live momentum buffers or parameters.  The subsequent
-    optimizer.step() performs the actual buffer update and parameter update.
+        B_t = beta B_{t-1} + (1-beta) G_t,
+
+    and its actual Nesterov direction
+
+        V_t = (1-beta) G_t + beta B_t.
+
+    The spectral-norm CSD LMO is the negative polar factor. Its ideal
+    first-order decrease for a layer is eta * ||V_t||_*. Summing over the
+    Muon matrix groups gives the candidate score used for symmetry selection.
+    No loss lower bound or adaptive LR scaling is involved.
     """
-    groups = _momo_muon_groups(optimizer)
+    groups = _muon_groups(optimizer)
     beta = float(groups[0].get("momentum", 0.95))
-    f_star = float(
-        getattr(args, "tele_momo_f_star", getattr(args, "momo_f_star", 0.0))
-    )
-    if not math.isfinite(f_star):
-        raise ValueError(f"The Momo lower bound must be finite; got {f_star}.")
+    if not (0.0 <= beta < 1.0):
+        raise ValueError(f"Muon momentum must lie in [0, 1); got {beta}.")
 
     loss_value = float(loss.detach().float().item())
-    grad_dot_param = 0.0
-    momentum_dot_param = 0.0
-    dual_norm = 0.0
+    momentum_dual_norm = 0.0
+    nesterov_dual_norm = 0.0
     lr_weighted_dual_norm = 0.0
     active_parameters = 0
 
     for group in groups:
         group_lr = float(group.get("lr", 0.0))
         group_beta = float(group.get("momentum", beta))
+        if abs(group_beta - beta) > 1e-12:
+            raise ValueError("CSD candidate scoring requires a common Muon momentum coefficient.")
+
         for parameter in group["params"]:
             gradient = parameter.grad
-            if gradient is None:
-                continue
-            if parameter.ndim < 2:
+            if gradient is None or parameter.ndim < 2:
                 continue
 
             state = optimizer.state.get(parameter, {})
@@ -495,144 +498,37 @@ def _momo_metrics_from_loss(
             else:
                 momentum = grad32.mul(1.0 - group_beta)
 
-            parameter32 = parameter.detach().float()
-            grad_dot_param += float(torch.sum(grad32 * parameter32).item())
-            momentum_dot_param += float(torch.sum(momentum * parameter32).item())
+            # Matches muon.py: update = gradient.lerp(momentum_buffer, beta).
+            nesterov_direction = torch.lerp(grad32, momentum, group_beta)
 
-            # The dual of the spectral norm is the nuclear norm.  Sum over
-            # Muon matrix blocks (the dual of the max/product spectral norm).
-            block_dual_norm = float(
-                torch.linalg.matrix_norm(_momo_matrix_view(momentum), ord="nuc").item()
+            momentum_norm = float(
+                torch.linalg.matrix_norm(_muon_matrix_view(momentum), ord="nuc").item()
             )
-            dual_norm += block_dual_norm
-            lr_weighted_dual_norm += group_lr * block_dual_norm
+            nesterov_norm = float(
+                torch.linalg.matrix_norm(_muon_matrix_view(nesterov_direction), ord="nuc").item()
+            )
+            momentum_dual_norm += momentum_norm
+            nesterov_dual_norm += nesterov_norm
+            lr_weighted_dual_norm += group_lr * nesterov_norm
             active_parameters += 1
 
     if active_parameters == 0:
-        raise RuntimeError(
-            "No Muon matrix parameters received gradients; cannot construct the Momo model."
-        )
-
-    # The first Momo observation is anchored so that the initial model value
-    # equals the observed minibatch loss, while retaining this repository's
-    # zero-initialized EMA convention for the first Muon optimizer step.
-    momo_state = groups[0].get("_teleport_momo_state")
-    initialized = isinstance(momo_state, dict) and bool(momo_state.get("initialized", False))
-    if initialized:
-        f_previous = float(momo_state["f_tilde"])
-    else:
-        if beta > 1e-12:
-            f_previous = loss_value + ((1.0 - beta) * grad_dot_param - momentum_dot_param) / beta
-        else:
-            f_previous = 0.0
-
-    f_tilde = beta * f_previous + (1.0 - beta) * (loss_value - grad_dot_param)
-    model_value = f_tilde + momentum_dot_param
-    gap = max(model_value - f_star, 0.0)
-
-    # For a common Muon learning rate eta, this is exactly
-    # min{eta * sum_l ||M_l||_*, max(F_tilde - F_*, 0)}.
-    # The lr-weighted form also preserves relative rates if several Muon
-    # groups use different learning rates.
-    if lr_weighted_dual_norm > 0.0:
-        lr_scale = min(1.0, gap / lr_weighted_dual_norm)
-    else:
-        lr_scale = 0.0
-    lr_scale = min(1.0, max(0.0, float(lr_scale)))
-    score = lr_scale * lr_weighted_dual_norm
-    reference_lr = max(float(group.get("lr", 0.0)) for group in groups)
-    radius = reference_lr * lr_scale
+        raise RuntimeError("No Muon matrix parameters received gradients; cannot score CSD candidates.")
+    if not math.isfinite(lr_weighted_dual_norm):
+        raise ValueError("Non-finite CSD candidate score.")
 
     return {
-        "score": float(score),
+        "score": float(lr_weighted_dual_norm),
         "loss": loss_value,
-        "f_tilde": float(f_tilde),
-        "model_value": float(model_value),
-        "gap": float(gap),
-        "dual_norm": float(dual_norm),
+        "momentum_dual_norm": float(momentum_dual_norm),
+        "dual_norm": float(nesterov_dual_norm),
+        "nesterov_dual_norm": float(nesterov_dual_norm),
         "lr_weighted_dual_norm": float(lr_weighted_dual_norm),
-        "radius": float(radius),
-        "lr_scale": float(lr_scale),
+        "lr_scale": 1.0,
         "beta": float(beta),
-        "f_star": float(f_star),
-        "grad_dot_param": float(grad_dot_param),
-        "momentum_dot_param": float(momentum_dot_param),
         "active_parameters": float(active_parameters),
         "step_index": float(step_index) if step_index is not None else -1.0,
     }
-
-
-def _store_momo_state(
-    optimizer: torch.optim.Optimizer,
-    metrics: Dict[str, float],
-    step_index: int,
-) -> None:
-    """Persist the scalar Momo model in the optimizer param group/checkpoint."""
-    groups = _momo_muon_groups(optimizer)
-    groups[0]["_teleport_momo_state"] = {
-        "initialized": True,
-        "f_tilde": float(metrics["f_tilde"]),
-        "last_step": int(step_index),
-        "beta": float(metrics["beta"]),
-        "f_star": float(metrics["f_star"]),
-    }
-
-
-def _schedule_one_step_momo_scale(
-    optimizer: torch.optim.Optimizer,
-    lr_scale: float,
-) -> None:
-    """Scale the next real Muon step without changing optimizer.step's API.
-
-    The repository's training loop calls optimizer.step() immediately after
-    its backward pass.  This one-shot wrapper applies the Momo scale to Muon
-    groups only, restores their learning rates afterwards, and leaves the
-    auxiliary Adam groups unchanged.  Decoupled weight decay remains at its
-    original strength; only the Muon descent update is scaled.
-    """
-    scale = min(1.0, max(0.0, float(lr_scale)))
-    if not math.isfinite(scale):
-        raise ValueError(f"Momo learning-rate scale must be finite; got {scale}.")
-    if getattr(optimizer, "_teleport_momo_step_pending", False):
-        raise RuntimeError(
-            "A Momo-scaled optimizer step is already pending. "
-            "Call optimizer.step() once before scheduling another Momo step."
-        )
-    optimizer._teleport_momo_pending_scale = scale
-    groups = _momo_muon_groups(optimizer)
-    if abs(scale - 1.0) <= 1e-12:
-        return
-
-    original_step = optimizer.step
-    saved_values = [
-        (group, float(group.get("lr", 0.0)), float(group.get("weight_decay", 0.0)))
-        for group in groups
-    ]
-
-    def momo_scaled_step(*step_args, **step_kwargs):
-        try:
-            # Keep decoupled weight decay at the base learning rate, while
-            # multiplying only the optimizer's Muon descent update by scale.
-            with torch.no_grad():
-                for group, base_lr, base_weight_decay in saved_values:
-                    if base_weight_decay != 0.0:
-                        decay_factor = 1.0 - base_lr * base_weight_decay
-                        for parameter in group["params"]:
-                            if parameter.grad is not None:
-                                parameter.mul_(decay_factor)
-                    group["weight_decay"] = 0.0
-                    group["lr"] = base_lr * scale
-            return original_step(*step_args, **step_kwargs)
-        finally:
-            for group, base_lr, base_weight_decay in saved_values:
-                group["lr"] = base_lr
-                group["weight_decay"] = base_weight_decay
-            optimizer.step = original_step
-            optimizer._teleport_momo_step_pending = False
-
-    optimizer.step = momo_scaled_step
-    optimizer._teleport_momo_step_pending = True
-    optimizer._teleport_momo_pending_scale = scale
 
 
 def compute_symmetry_muon_alignment(
@@ -642,16 +538,15 @@ def compute_symmetry_muon_alignment(
     criterion: nn.Module,
     args: Any,
 ) -> float:
-    """Return the Momo-truncated predicted decrease for one candidate.
+    """Return the CSD predicted-decrease score for one candidate.
 
     The public signature and scalar return type are retained for compatibility.
-    Candidate-specific details are calculated by _momo_metrics_from_loss.
     """
     optimizer.zero_grad(set_to_none=True)
     logits = model(pixel_values=batch[0]).logits
     loss = criterion(logits, batch[1])
     loss.backward()
-    return _momo_metrics_from_loss(optimizer, loss, args)["score"]
+    return _csd_metrics_from_loss(optimizer, loss, args)["score"]
 
 
 def update_momo_for_step(
@@ -661,26 +556,17 @@ def update_momo_for_step(
     step_index: int,
     args: Any,
 ) -> Dict[str, float]:
-    """Update the Momo scalar model and schedule the current Muon step.
+    """Backward-compatible no-op; the CSD variant has no Momo state.
 
-    Call after loss.backward() and immediately before optimizer.step() on every
-    minibatch when using tele_method='muon_alignment'.  Teleportation scoring
-    may already have processed this step; last_step prevents a duplicate update.
+    Kept with its original signature so older launchers importing this symbol
+    do not fail. The CSD launcher does not call it.
     """
-    groups = _momo_muon_groups(optimizer)
-    previous_state = groups[0].get("_teleport_momo_state")
-    if isinstance(previous_state, dict) and int(previous_state.get("last_step", -1)) == int(step_index):
-        return {
-            "score": float(getattr(optimizer, "_teleport_momo_last_score", 0.0)),
-            "lr_scale": float(getattr(optimizer, "_teleport_momo_pending_scale", 1.0)),
-            "already_updated": 1.0,
-        }
-
-    metrics = _momo_metrics_from_loss(optimizer, loss, args, step_index=step_index)
-    _store_momo_state(optimizer, metrics, step_index)
-    _schedule_one_step_momo_scale(optimizer, metrics["lr_scale"])
-    optimizer._teleport_momo_last_score = float(metrics["score"])
-    return metrics
+    return {
+        "score": 0.0,
+        "lr_scale": 1.0,
+        "already_updated": 1.0,
+        "csd_mode": 1.0,
+    }
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -826,26 +712,21 @@ def try_muon_alignment_teleportation(
     args: Any,
     step_index: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Select a symmetry by the Momo-truncated model and transport its state.
+    """Select a symmetry by CSD predicted decrease and transport its state.
 
-    Candidate evaluation is isolated on cloned model/optimizer pairs.  For
-    each candidate, the current minibatch gradient is used to predict the
-    repository's next EMA momentum buffer.  The Momo model then gives
+    Each candidate is evaluated on an isolated model/optimizer clone. Its
+    score is the sum over Muon matrix parameters of
 
-        f_tilde = beta*f_tilde_prev
-                   + (1-beta)*(F_t - sum_l <G_t^l, W_t^l>),
-        Fhat_t   = f_tilde + sum_l <M_t^l, W_t^l>,
-        D_t      = sum_l ||M_t^l||_*.
+        eta_l * ||V_t^(l)||_*,
 
-    With F_* a known loss lower bound and eta the Muon learning rate,
+    where V_t is the same Nesterov direction used by the repository Muon
+    implementation. This is the ideal first-order decrease of the associated
+    spectral-norm CSD step (with the polar factor as the LMO).
 
-        r_t = min(eta, max(Fhat_t-F_*, 0)/D_t),
-        S_t = r_t*D_t = min(eta*D_t, max(Fhat_t-F_*, 0)).
-
-    The maximizing candidate is committed, its pre-existing Muon momentum is
-    transported, and the selected Momo radius scales the next real Muon step.
-    The auxiliary Adam groups retain their ordinary update and optimizer state
-    handling.  Existing public signature and telemetry keys are preserved.
+    A non-identity candidate is committed only if it beats identity by
+    ``tele_accept_tol``. The normal training loop then performs its ordinary
+    Muon optimizer step with the unchanged base learning rate. This function
+    never changes optimizer learning rates or maintains a Momo scalar model.
     """
     started = time.perf_counter()
     rng_state = capture_rng_state()
@@ -857,11 +738,9 @@ def try_muon_alignment_teleportation(
             "--tele-candidates must be >= 2."
         )
 
-    # Validate the optimizer family before doing candidate work.
-    _momo_muon_groups(optimizer)
+    _muon_groups(optimizer)
     was_training = model.training
     committed = False
-    accepted = False
     model.train()
     try:
         candidates = generate_symmetry_candidates(
@@ -888,12 +767,12 @@ def try_muon_alignment_teleportation(
             logits = candidate_model(pixel_values=batch[0]).logits
             loss = criterion(logits, batch[1])
             loss.backward()
-            metrics = _momo_metrics_from_loss(
+            metrics = _csd_metrics_from_loss(
                 candidate_optimizer, loss, args, step_index=step_index
             )
             if not math.isfinite(float(metrics["score"])):
                 raise ValueError(
-                    f"Non-finite Momo score for candidate {index}: {metrics['score']}."
+                    f"Non-finite CSD score for candidate {index}: {metrics['score']}."
                 )
 
             results.append(
@@ -908,24 +787,17 @@ def try_muon_alignment_teleportation(
                     "transform_type": "mnistcifar_symmetry_preserving_matrix",
                     "uses_attention": bool(getattr(args, "tele_att", 1)),
                     "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
-                    # Legacy alignment fields now carry the Momo score.
+                    # Keep the legacy alignment field for existing W&B tables.
                     "alignment": float(metrics["score"]),
-                    "momo_predicted_decrease": float(metrics["score"]),
-                    "momo_loss": float(metrics["loss"]),
-                    "momo_f_tilde": float(metrics["f_tilde"]),
-                    "momo_model_value": float(metrics["model_value"]),
-                    "momo_gap": float(metrics["gap"]),
-                    "momo_dual_norm": float(metrics["dual_norm"]),
-                    "momo_lr_weighted_dual_norm": float(metrics["lr_weighted_dual_norm"]),
-                    "momo_radius": float(metrics["radius"]),
-                    "momo_lr_scale": float(metrics["lr_scale"]),
-                    "momo_beta": float(metrics["beta"]),
-                    "momo_f_star": float(metrics["f_star"]),
-                    "momo_active_parameters": int(metrics["active_parameters"]),
-                    "paper_momentum_linearized_decrease": float(metrics["score"]),
-                    "alignment_evaluated": True,
+                    "csd_predicted_decrease": float(metrics["score"]),
+                    "csd_momentum_dual_norm": float(metrics["momentum_dual_norm"]),
+                    "csd_nesterov_dual_norm": float(metrics["nesterov_dual_norm"]),
+                    "csd_lr_weighted_dual_norm": float(metrics["lr_weighted_dual_norm"]),
+                    "csd_beta": float(metrics["beta"]),
+                    "csd_active_parameters": int(metrics["active_parameters"]),
                     "predicted_first_order_decrease": float(metrics["score"]),
                     "predicted_decrease_evaluated": True,
+                    "alignment_evaluated": True,
                     "alignment_rank": None,
                     "virtual_loss_evaluated": False,
                     "post_step_loss": None,
@@ -933,59 +805,55 @@ def try_muon_alignment_teleportation(
                 }
             )
 
-        # Exact finite-set argmax. Identity is included and wins exact ties.
         ranked = sorted(
             results,
-            key=lambda item: (-float(item["momo_predicted_decrease"]), int(item["candidate_index"])),
+            key=lambda item: (-float(item["csd_predicted_decrease"]), int(item["candidate_index"])),
         )
         for rank, item in enumerate(ranked, start=1):
             item["alignment_rank"] = rank
-        selected = ranked[0]
-        selected_index = int(selected["candidate_index"])
-        selected_candidate = candidates[selected_index]
+
         identity_result = next(item for item in results if item["identity"])
         non_identity_results = [item for item in results if not item["identity"]]
         best_non_identity = max(
             non_identity_results,
-            key=lambda item: float(item["momo_predicted_decrease"]),
+            key=lambda item: float(item["csd_predicted_decrease"]),
         ) if non_identity_results else None
+
+        accept_tol = float(getattr(args, "tele_accept_tol", 0.0))
+        if not math.isfinite(accept_tol) or accept_tol < 0.0:
+            raise ValueError(
+                f"tele_accept_tol must be finite and nonnegative; got {accept_tol}."
+            )
+        identity_score = float(identity_result["csd_predicted_decrease"])
+        accepted = (
+            best_non_identity is not None
+            and float(best_non_identity["csd_predicted_decrease"]) > identity_score + accept_tol
+        )
+        selected = best_non_identity if accepted else identity_result
+        selected_index = int(selected["candidate_index"])
+        selected_candidate = candidates[selected_index]
 
         # Candidate search must not alter the live training state.
         restore_rng_state(rng_state)
         model.train(was_training)
         assert_live_state_unchanged(model, optimizer, live_snapshot)
 
-        accepted = not bool(selected["identity"])
         if accepted:
             apply_symmetry_candidate(model, selected_candidate, args)
             transport_teleportation_optimizer_state(
                 model, optimizer, selected_candidate, args
             )
             committed = True
-            reason = "selected_max_momo_predicted_decrease"
+            reason = "selected_max_csd_predicted_decrease"
         else:
-            reason = "identity_selected_max_momo_predicted_decrease_noop"
+            reason = "identity_selected_max_csd_predicted_decrease_noop"
 
-        # Advance the scalar Momo model once for this minibatch and scale the
-        # real optimizer.step() that follows try_teleportation in train.py.
-        selected_metrics = {
-            "score": float(selected["momo_predicted_decrease"]),
-            "f_tilde": float(selected["momo_f_tilde"]),
-            "beta": float(selected["momo_beta"]),
-            "f_star": float(selected["momo_f_star"]),
-            "lr_scale": float(selected["momo_lr_scale"]),
-        }
-        _store_momo_state(optimizer, selected_metrics, step_index)
-        _schedule_one_step_momo_scale(optimizer, selected_metrics["lr_scale"])
-        optimizer._teleport_momo_last_score = selected_metrics["score"]
-
-        identity_score = float(identity_result["momo_predicted_decrease"])
-        selected_score = float(selected["momo_predicted_decrease"])
+        selected_score = float(selected["csd_predicted_decrease"])
         score_gain = selected_score - identity_score
         search_time = round(time.perf_counter() - started, 6)
 
         telemetry = {
-            "method": "muon_alignment",
+            "method": "csd_alignment",
             "accepted": accepted,
             "reason": reason,
             "step": step_index,
@@ -1001,7 +869,7 @@ def try_muon_alignment_teleportation(
             "selected_alignment": selected_score,
             "selected_paper_momentum_linearized_decrease": selected_score,
             "selected_post_step_loss": None,
-            "selected_identity": bool(selected["identity"]),
+            "selected_identity": not accepted,
             "selected_candidate_index": selected_index,
             "selected_scale": selected["scale"],
             "scale_min": selected["scale_min"],
@@ -1009,24 +877,22 @@ def try_muon_alignment_teleportation(
             "selected_attention_scale": selected_candidate["attention_scale_summary"],
             "selected_mlp_scale": selected_candidate["mlp_scale_summary"],
             "identity_rank": int(identity_result["alignment_rank"]),
-            # No Muon momentum is reset; only transformed Adam bias states
-            # are cleared by transport_teleportation_optimizer_state.
             "state_reset": False,
             "muon_momentum_reset": False,
             "auxiliary_adam_state_reset": accepted,
             "momentum_state_transported": accepted,
-            "selection_objective": "momo_truncated_model_decrease",
-            "paper_objective_definition": "min(sum_muon_groups(lr * sum_l nuclear_norm(M_t^l)), max(F_tilde_t - F_star, 0))",
-            "momo_loss": selected["momo_loss"],
-            "momo_f_tilde": selected["momo_f_tilde"],
-            "momo_model_value": selected["momo_model_value"],
-            "momo_gap": selected["momo_gap"],
-            "momo_dual_norm": selected["momo_dual_norm"],
-            "momo_lr_weighted_dual_norm": selected["momo_lr_weighted_dual_norm"],
-            "momo_radius": selected["momo_radius"],
-            "momo_lr_scale": selected["momo_lr_scale"],
-            "momo_beta": selected["momo_beta"],
-            "momo_f_star": selected["momo_f_star"],
+            "selection_objective": "constrained_steepest_descent",
+            "paper_objective_definition": (
+                "sum_muon_groups(lr * sum_l nuclear_norm(nesterov_direction_l))"
+            ),
+            "csd_predicted_decrease": float(selected["csd_predicted_decrease"]),
+            "csd_momentum_dual_norm": float(selected["csd_momentum_dual_norm"]),
+            "csd_nesterov_dual_norm": float(selected["csd_nesterov_dual_norm"]),
+            "csd_lr_weighted_dual_norm": float(selected["csd_lr_weighted_dual_norm"]),
+            "csd_lr_multiplier_applied": 1.0,
+            "adaptive_lr_scaling_applied": False,
+            "tele_accept_tol": accept_tol,
+            "csd_beta": float(selected["csd_beta"]),
             "identity_predicted_first_order_decrease": identity_score,
             "selected_predicted_first_order_decrease": selected_score,
             "tele_layer": args.tele_layer,
@@ -1062,12 +928,12 @@ def try_teleportation(
     args: Any,
     step_index: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Momo-Muon dispatcher; deliberately rejects the unrelated naive path."""
+    """CSD-based Muon teleportation dispatcher; rejects the naive path."""
     method = getattr(args, "tele_method", "muon_alignment")
     if method != "muon_alignment":
         raise ValueError(
             "train-muon.py supports only --tele-method muon_alignment; "
-            "use the original train.py for naive or non-Momo runs."
+            "use the original train.py for naive or plain runs."
         )
     return try_muon_alignment_teleportation(
         model, optimizer, batch, criterion, args, step_index
@@ -1079,5 +945,6 @@ __all__ = [
     "try_teleportation",
     "try_muon_alignment_teleportation",
     "update_momo_for_step",
+    "compute_symmetry_muon_alignment",
 ]
 
