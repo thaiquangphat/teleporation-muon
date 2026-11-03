@@ -119,7 +119,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
         return loss
 
 
-def create_muon_optimizer(model, lr, weight_decay, momentum=0.95):
+def create_muon_optimizer(model, lr, weight_decay, momentum=0.95, adam_lr=3e-4):
     """Use Muon for transformer matrix weights and AdamW for the remaining weights."""
     muon_parameters = []
     adam_parameters = []
@@ -149,7 +149,7 @@ def create_muon_optimizer(model, lr, weight_decay, momentum=0.95):
             {
                 "params": adam_parameters,
                 "use_muon": False,
-                "lr": lr,
+                "lr": adam_lr,
                 "betas": (0.9, 0.95),
                 "eps": 1e-10,
                 "weight_decay": weight_decay,

@@ -46,7 +46,8 @@ def parse_args():
     parser.add_argument("--position-embedding", type=str, default="learnable", choices=["rope", "learnable"])
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--opt", type=str, default="adamw", choices=["adamw", "sgd", "muon"])
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate for the main optimizer group (Muon when --opt=muon).")
+    parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for the auxiliary AdamW group when --opt=muon.")
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["step", "cosine", "plateau"])
@@ -106,16 +107,18 @@ def build_optimizer(model, args):
         lr=args.lr,
         weight_decay=args.weight_decay,
         momentum=args.momentum,
+        adam_lr=args.adam_lr,
     )
 
 
 def build_run_name(args):
+    adam_lr_suffix = f"_adam-lr{args.adam_lr}" if args.opt == "muon" else ""
     if args.tele_method == "none" and args.n_teleport <= 0:
         return (
-            f"NoTeleport-lr{args.lr}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
+            f"NoTeleport-lr{args.lr}{adam_lr_suffix}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
         )
     return (
-        f"Teleport-{args.tele_method}-lr{args.lr}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
+        f"Teleport-{args.tele_method}-lr{args.lr}{adam_lr_suffix}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
         f"att{args.tele_att}_mlp{args.tele_mlp}_"
         f"tele-opt{args.tele_opt}_tele-high{args.tele_high}_tele-low{args.tele_low}_tele-cons{args.tele_cons}_tele-sign{args.tele_sign}_"
         f"tele-layer{args.tele_layer}_tele-batch{args.tele_batch}_tele-epoch{args.tele_epoch_array}_cands{args.tele_candidates}_seed{args.seed}"
@@ -379,6 +382,11 @@ def main():
                     {
                         "train/batch_loss": loss.item(),
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/muon_learning_rate": optimizer.param_groups[0]["lr"],
+                        **(
+                            {"train/adam_learning_rate": optimizer.param_groups[1]["lr"]}
+                            if args.opt == "muon" else {}
+                        ),
                         "train/batch_size": labels.size(0),
                     }
                 )
@@ -388,6 +396,9 @@ def main():
             total_train_time_seconds += train_time_seconds
             avg_loss = running_loss / max(processed_batches, 1)
             current_lr = optimizer.param_groups[0]["lr"]
+            current_adam_lr = (
+                optimizer.param_groups[1]["lr"] if args.opt == "muon" else None
+            )
 
             synchronize_device(device)
             validation_started = time.perf_counter()
@@ -446,6 +457,11 @@ def main():
                     "epoch": epoch,
                     "train/epoch_loss": avg_loss,
                     "train/learning_rate": current_lr,
+                    "train/muon_learning_rate": current_lr,
+                    **(
+                        {"train/adam_learning_rate": current_adam_lr}
+                        if current_adam_lr is not None else {}
+                    ),
                     "train/batches": processed_batches,
                     "train/samples": processed_samples,
                     "train/samples_per_second": (
