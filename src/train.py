@@ -66,8 +66,8 @@ def parse_args():
         "--tele-method",
         type=str,
         default="none",
-        choices=["none", "naive", "muon_alignment"],
-        help="none keeps a plain optimizer baseline; naive is the original MNISTCIFAR teleport; muon_alignment is the Q/K Muon-aware search.",
+        choices=["none", "naive", "csd_l2", "muon_alignment"],
+        help="none keeps a plain optimizer baseline; naive is the original MNISTCIFAR teleport; csd_l2 selects symmetry candidates by the CSD-L2 score (muon_alignment is a backward-compatible alias).",
     )
     parser.add_argument("--tele-candidates", type=int, default=6)
     parser.add_argument("--tele-accept-tol", type=float, default=1e-6)
@@ -272,8 +272,8 @@ def main():
                 "accepted",
                 "reason",
                 "search_time_seconds",
-                "alignment_gain",
-                "selected_alignment",
+                "csd_l2_gain",
+                "selected_csd_l2_score",
                 "selected_candidate_index",
                 "num_candidates_evaluated",
             ]
@@ -286,8 +286,8 @@ def main():
                 "method",
                 "candidate_index",
                 "is_identity",
-                "alignment",
-                "alignment_rank",
+                "csd_l2_score",
+                "csd_l2_rank",
                 "post_step_loss_evaluated",
                 "post_step_loss",
             ]
@@ -338,8 +338,8 @@ def main():
                         accepted,
                         info.get("reason", ""),
                         info.get("search_time_seconds", 0.0),
-                        info.get("alignment_gain"),
-                        info.get("selected_alignment"),
+                        info.get("csd_l2_gain", info.get("alignment_gain")),
+                        info.get("selected_csd_l2_score", info.get("selected_alignment")),
                         info.get("selected_candidate_index"),
                         info.get("num_candidates_evaluated"),
                     )
@@ -351,8 +351,8 @@ def main():
                             info.get("method", method),
                             candidate.get("candidate_index"),
                             candidate.get("identity"),
-                            candidate.get("alignment"),
-                            candidate.get("alignment_rank"),
+                            candidate.get("csd_l2_score", candidate.get("alignment")),
+                            candidate.get("csd_l2_rank", candidate.get("alignment_rank")),
                             candidate.get("post_step_loss") is not None,
                             candidate.get("post_step_loss"),
                         )
@@ -361,8 +361,10 @@ def main():
                         "teleport/accepted": accepted_teleports,
                         "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
                         "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
-                        "teleport/alignment_gain": info.get("alignment_gain"),
-                        "teleport/selected_alignment": info.get("selected_alignment"),
+                        "teleport/csd_l2_gain": info.get("csd_l2_gain", info.get("alignment_gain")),
+                        "teleport/selected_csd_l2_score": info.get(
+                            "selected_csd_l2_score", info.get("selected_alignment")
+                        ),
                         "teleport/selected_candidate_index": info.get("selected_candidate_index"),
                         "teleport/num_candidates_evaluated": info.get("num_candidates_evaluated"),
                         "teleport/accepted_event": int(accepted),
