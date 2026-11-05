@@ -644,6 +644,81 @@ def _csd_l2_metrics_from_optimizer(
     }
 
 
+
+def _nesterov_csd_l2_metrics_from_optimizer(
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, Any]:
+    """Compute the CSD-L2 score using Muon's actual pre-Newton--Schulz direction.
+
+    The repository's Muon step performs:
+
+        B_t = beta * B_{t-1} + (1 - beta) * G_t
+        V_t = (1 - beta) * G_t + beta * B_t
+
+    Hence:
+
+        V_t = beta**2 * B_{t-1} + (1 - beta**2) * G_t.
+
+    The score is sqrt(sum_l ||V_l||_* ** 2). This requires only a linear
+    combination and nuclear norms; it does not compute polar factors or run
+    Newton--Schulz for each teleportation candidate.
+    """
+    squared_norm_sum = 0.0
+    nuclear_norms: List[float] = []
+
+    for group in optimizer.param_groups:
+        if not bool(group.get("use_muon", False)):
+            continue
+
+        beta = float(group.get("momentum", 0.95))
+        if not math.isfinite(beta) or not (0.0 <= beta < 1.0):
+            raise ValueError(f"Muon momentum must lie in [0, 1); got {beta}.")
+
+        beta_sq = beta * beta
+        current_gradient_weight = 1.0 - beta_sq
+
+        for parameter in group["params"]:
+            if parameter.ndim < 2 or parameter.grad is None:
+                continue
+
+            gradient = parameter.grad.detach().float()
+            previous_momentum = optimizer.state.get(parameter, {}).get("momentum_buffer")
+            if torch.is_tensor(previous_momentum):
+                # Exact raw direction formed by gradient.lerp(momentum_buffer, beta)
+                # after momentum_buffer.lerp_(gradient, 1 - beta).
+                direction = previous_momentum.detach().float().mul(beta_sq).add(
+                    gradient, alpha=current_gradient_weight
+                )
+            else:
+                # On the first step B_{t-1}=0, so V_t=(1-beta^2)G_t.
+                direction = gradient.mul(current_gradient_weight)
+
+            nuclear_norm = float(
+                torch.linalg.matrix_norm(_muon_matrix_view(direction), ord="nuc").item()
+            )
+            if not math.isfinite(nuclear_norm):
+                raise ValueError("Nesterov CSD-L2 encountered a non-finite nuclear norm.")
+            nuclear_norms.append(nuclear_norm)
+            squared_norm_sum += nuclear_norm * nuclear_norm
+
+    if not nuclear_norms:
+        raise RuntimeError(
+            "No Muon matrix parameters received gradients; "
+            "cannot compute the Nesterov CSD-L2 score."
+        )
+
+    score = math.sqrt(squared_norm_sum)
+    return {
+        "score": float(score),
+        "squared_score": float(squared_norm_sum),
+        "matrix_count": len(nuclear_norms),
+        "matrix_nuclear_norms": nuclear_norms,
+        "max_matrix_nuclear_norm": max(nuclear_norms),
+        "sum_matrix_nuclear_norms": sum(nuclear_norms),
+        "momentum_direction": "nesterov_corrected_pre_newton_schulz",
+    }
+
+
 def compute_symmetry_csd_l2(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -656,6 +731,20 @@ def compute_symmetry_csd_l2(
     loss = criterion(logits, batch[1])
     loss.backward()
     return _csd_l2_metrics_from_optimizer(optimizer)["score"]
+
+
+def compute_symmetry_csd_l2_nesterov(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+) -> float:
+    """Return the Nesterov-corrected CSD-L2 score for one candidate."""
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(pixel_values=batch[0]).logits
+    loss = criterion(logits, batch[1])
+    loss.backward()
+    return _nesterov_csd_l2_metrics_from_optimizer(optimizer)["score"]
 
 
 def compute_symmetry_muon_alignment(
@@ -878,24 +967,26 @@ def _resolve_alignment_shortlist(args: Any, non_identity_count: int) -> int:
     return min(shortlist, non_identity_count)
 
 
-def try_csd_l2_teleportation(
+def _try_csd_l2_teleportation_impl(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     batch: Tuple[torch.Tensor, torch.Tensor],
     criterion: nn.Module,
     args: Any,
     step_index: int,
+    metrics_fn,
+    method_name: str,
+    score_definition: str,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Select and commit the symmetry with the largest CSD-L2 score.
+    """Evaluate and commit a candidate using the selected CSD-L2 score.
 
     Each candidate is evaluated on a cloned model/optimizer. Its gradients and
-    transported pre-existing Muon momentum are used to construct the next
-    momentum matrices M_l(T), then candidates are ranked by
-
-        S_L2(T) = sqrt(sum_l ||M_l(T)||_* ** 2).
+    transported pre-existing Muon momentum are passed to ``metrics_fn``. The
+    legacy wrapper scores the EMA momentum; the Nesterov wrapper scores the
+    pre-Newton--Schulz direction used by this repository's Muon implementation.
 
     Identity is always included and wins exact ties. The live optimizer's
-    ordinary learning rates, weight decay, and update rule are not modified.
+    learning rates, weight decay, and update rule are not modified.
     """
     started = time.perf_counter()
     rng_state = capture_rng_state()
@@ -943,10 +1034,10 @@ def try_csd_l2_teleportation(
             logits = candidate_model(pixel_values=batch[0]).logits
             loss = criterion(logits, batch[1])
             loss.backward()
-            metrics = _csd_l2_metrics_from_optimizer(candidate_optimizer)
+            metrics = metrics_fn(candidate_optimizer)
             if not math.isfinite(float(metrics["score"])):
                 raise ValueError(
-                    f"Non-finite CSD-L2 score for candidate {index}: {metrics['score']}."
+                    f"Non-finite {method_name} score for candidate {index}: {metrics['score']}."
                 )
 
             results.append(
@@ -974,6 +1065,9 @@ def try_csd_l2_teleportation(
                         metrics["sum_matrix_nuclear_norms"]
                     ),
                     "csd_l2_matrix_nuclear_norms": metrics["matrix_nuclear_norms"],
+                    "csd_l2_momentum_direction": metrics.get(
+                        "momentum_direction", "ema_momentum"
+                    ),
                     "alignment_evaluated": True,
                     "alignment_rank": None,
                     "virtual_loss_evaluated": False,
@@ -1013,9 +1107,9 @@ def try_csd_l2_teleportation(
                 model, optimizer, selected_candidate, args
             )
             committed = True
-            reason = "selected_max_csd_l2_score"
+            reason = f"selected_max_{method_name}_score"
         else:
-            reason = "identity_selected_max_csd_l2_score_noop"
+            reason = f"identity_selected_max_{method_name}_score_noop"
 
         identity_score = float(identity_result["csd_l2_score"])
         selected_score = float(selected["csd_l2_score"])
@@ -1023,7 +1117,7 @@ def try_csd_l2_teleportation(
         search_time = round(time.perf_counter() - started, 6)
 
         telemetry = {
-            "method": "csd_l2",
+            "method": method_name,
             "accepted": accepted,
             "reason": reason,
             "step": step_index,
@@ -1047,8 +1141,12 @@ def try_csd_l2_teleportation(
             "muon_momentum_reset": False,
             "auxiliary_adam_state_reset": accepted,
             "momentum_state_transported": accepted,
-            "selection_objective": "csd_l2_euclidean_aggregate_of_nuclear_norms",
-            "csd_l2_definition": "sqrt(sum_over_muon_matrices(nuclear_norm(predicted_momentum_matrix)^2))",
+            "selection_objective": method_name + "_euclidean_aggregate_of_nuclear_norms",
+            "csd_l2_definition": score_definition,
+            "momentum_direction": (
+                "nesterov_corrected_pre_newton_schulz"
+                if method_name == "csd_l2_nesterov" else "ema_momentum"
+            ),
             "csd_l2_matrix_count": int(selected["csd_l2_matrix_count"]),
             "csd_l2_matrix_nuclear_norms": selected["csd_l2_matrix_nuclear_norms"],
             "identity_predicted_first_order_decrease": None,
@@ -1073,6 +1171,43 @@ def try_csd_l2_teleportation(
         model.train(was_training)
         if not committed:
             assert_live_state_unchanged(model, optimizer, live_snapshot)
+
+
+def try_csd_l2_teleportation(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    args: Any,
+    step_index: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Legacy CSD-L2 teleportation score based on the EMA momentum B_t."""
+    return _try_csd_l2_teleportation_impl(
+        model, optimizer, batch, criterion, args, step_index,
+        metrics_fn=_csd_l2_metrics_from_optimizer,
+        method_name="csd_l2",
+        score_definition="sqrt(sum_over_muon_matrices(nuclear_norm(EMA_momentum_B_t)^2))",
+    )
+
+
+def try_csd_l2_nesterov_teleportation(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch: Tuple[torch.Tensor, torch.Tensor],
+    criterion: nn.Module,
+    args: Any,
+    step_index: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    """CSD-L2 teleportation scored using Muon's Nesterov-corrected direction."""
+    return _try_csd_l2_teleportation_impl(
+        model, optimizer, batch, criterion, args, step_index,
+        metrics_fn=_nesterov_csd_l2_metrics_from_optimizer,
+        method_name="csd_l2_nesterov",
+        score_definition=(
+            "sqrt(sum_over_muon_matrices(nuclear_norm(" 
+            "beta^2*previous_momentum + (1-beta^2)*current_gradient)^2))"
+        ),
+    )
 
 
 # Backward-compatible entry point for scripts that still use the old method name.
@@ -1112,4 +1247,8 @@ def try_teleportation(
         return accepted, {"method": "naive", "accepted": accepted, "step": step_index}
     if method in {"csd_l2", "muon_alignment"}:
         return try_csd_l2_teleportation(model, optimizer, batch, criterion, args, step_index)
+    if method == "csd_l2_nesterov":
+        return try_csd_l2_nesterov_teleportation(
+            model, optimizer, batch, criterion, args, step_index
+        )
     raise ValueError(f"Unsupported tele_method: {method}")

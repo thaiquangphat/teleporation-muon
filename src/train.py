@@ -66,8 +66,8 @@ def parse_args():
         "--tele-method",
         type=str,
         default="none",
-        choices=["none", "naive", "csd_l2", "muon_alignment"],
-        help="none keeps a plain optimizer baseline; naive is the original MNISTCIFAR teleport; csd_l2 selects symmetry candidates by the CSD-L2 score (muon_alignment is a backward-compatible alias).",
+        choices=["none", "naive", "csd_l2", "csd_l2_nesterov", "muon_alignment"],
+        help="none keeps a plain optimizer baseline; naive is the original MNISTCIFAR teleport; csd_l2 scores EMA momentum; csd_l2_nesterov scores Muon's Nesterov-corrected pre-Newton--Schulz direction; muon_alignment is a backward-compatible alias for csd_l2.",
     )
     parser.add_argument("--tele-candidates", type=int, default=6)
     parser.add_argument("--tele-accept-tol", type=float, default=1e-6)
