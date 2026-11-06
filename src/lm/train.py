@@ -17,16 +17,10 @@ import wandb
 import yaml
 from tqdm import tqdm
 
-try:
-    from .datamodule import get_wikitext_dataloaders
-    from .model import GPT2LMForCausalLM
-    from .teleport import create_lm_muon_optimizer, generate_tele_scheduler
-    from .csd_nesterov import try_teleportation
-except ImportError:  # python src/lm/train.py
-    from datamodule import get_wikitext_dataloaders
-    from model import GPT2LMForCausalLM
-    from teleport import create_lm_muon_optimizer, generate_tele_scheduler
-    from csd_nesterov import try_teleportation
+from datamodule import get_wikitext_dataloaders
+from model import GPT2LMForCausalLM
+from teleport import create_lm_muon_optimizer, generate_tele_scheduler
+from csd_nesterov import try_teleportation
 
 
 def list_of_ints(value: str) -> list[int]:
