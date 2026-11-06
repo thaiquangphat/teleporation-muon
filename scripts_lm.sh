@@ -55,7 +55,6 @@ run_for_seeds() {
 # Plain Muon baseline.
 run_for_seeds \
   --tele-method none \
-  --nesterov False \
   --save_dir ./checkpoints-lm/plain
 
 # ViT-style naive teleportation: gradient-L2 majority rule, followed by
@@ -63,7 +62,6 @@ run_for_seeds \
 # optimizer state is transported through the committed GPT-2 symmetry.
 run_for_seeds \
   --tele-method naive \
-  --nesterov False \
   --tele-att 1 --tele-mlp 0 --tele-layer all \
   --n-teleport "$N_TELEPORT" --tele-high 1.65 --tele-low 0.35 --tele-sign 0 \
   --tele-epoch-array "$TELE_EPOCHS" \
@@ -75,7 +73,6 @@ run_for_seeds \
 # identity wins exact ties.
 run_for_seeds \
   --nesterov \
-  --nesterov True \
   --tele-method csd_l2_nesterov \
   --tele-att 1 --tele-mlp 0 --tele-layer all \
   --tele-candidates "$TELE_CANDIDATES" --tele-high 1.65 --tele-low 0.35 --tele-sign 0 \
