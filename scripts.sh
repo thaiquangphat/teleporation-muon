@@ -7,7 +7,7 @@ load_wandb_config
 # Use the regular trainer for plain, naive, and CSD-L2 experiments.
 run_for_seeds() {
   for seed in 1; do
-    python3 src/train.py --seed "$seed" "$@"
+    python3 src/vit/train.py --seed "$seed" "$@"
   done
 }
 
