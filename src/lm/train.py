@@ -18,21 +18,15 @@ import yaml
 from tqdm import tqdm
 
 try:
-    from .lm_datamodule import get_wikitext_dataloaders
-    from .lm_model import GPT2LMForCausalLM
-    from .lm_teleport_muon import (
-        create_lm_muon_optimizer,
-        generate_tele_scheduler,
-        try_teleportation,
-    )
-except ImportError:
-    from lm_datamodule import get_wikitext_dataloaders
-    from lm_model import GPT2LMForCausalLM
-    from lm_teleport_muon import (
-        create_lm_muon_optimizer,
-        generate_tele_scheduler,
-        try_teleportation,
-    )
+    from .datamodule import get_wikitext_dataloaders
+    from .model import GPT2LMForCausalLM
+    from .teleport import create_lm_muon_optimizer, generate_tele_scheduler
+    from .csd_nesterov import try_teleportation
+except ImportError:  # python src/lm/train.py
+    from datamodule import get_wikitext_dataloaders
+    from model import GPT2LMForCausalLM
+    from teleport import create_lm_muon_optimizer, generate_tele_scheduler
+    from csd_nesterov import try_teleportation
 
 
 def list_of_ints(value: str) -> list[int]:
@@ -44,9 +38,10 @@ def list_of_ints(value: str) -> list[int]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GPT-2 CSD-Muon on WikiText")
-    parser.add_argument("--data-dir", type=str, default="./data")
+    parser.add_argument("--data-dir", type=str, default="./data/wt103")
+    parser.add_argument("--dataset-source", type=str, default="local", choices=["local", "huggingface"])
     parser.add_argument("--cache-dir", type=str, default=None)
-    parser.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1")
+    parser.add_argument("--dataset-config", type=str, default="wikitext-103-raw-v1")
     parser.add_argument("--model-name", type=str, default="gpt2")
     parser.add_argument("--position-embedding", type=str, default="ape", choices=["ape", "rope"])
     parser.add_argument("--block-size", type=int, default=512)
@@ -67,17 +62,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.002, help="Muon LR; used as AdamW LR when --opt=adamw")
     parser.add_argument("--adam-lr", type=float, default=5e-5)
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument(
+        "--nesterov",
+        action="store_true",
+        help="Use Nesterov-corrected Muon updates (enabled for the CSD-Nesterov experiment only).",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["none", "cosine", "step", "plateau"])
     parser.add_argument("--grad-clip", type=float, default=0.0)
 
-    parser.add_argument("--tele-method", type=str, default="none", choices=["none", "muon_alignment"])
+    parser.add_argument("--tele-method", type=str, default="none", choices=["none", "naive", "csd_l2_nesterov", "muon_alignment"])
     parser.add_argument("--tele-epoch-array", type=list_of_ints, default=[1])
     parser.add_argument("--tele-att", type=int, default=1)
     parser.add_argument("--tele-mlp", type=int, default=0)
     parser.add_argument("--tele-layer", type=str, default="all", choices=["all", "first", "last"])
     parser.add_argument("--tele-candidates", type=int, default=6)
-    parser.add_argument("--tele-accept-tol", type=float, default=1e-6)
+    parser.add_argument("--n-teleport", type=int, default=6, help="Total naive candidates, including identity")
     parser.add_argument("--tele-high", type=float, default=1.65)
     parser.add_argument("--tele-low", type=float, default=0.35)
     parser.add_argument("--tele-sign", type=int, default=0)
@@ -138,15 +138,28 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace) -> torch.optim.O
         weight_decay=args.weight_decay,
         momentum=args.momentum,
         adam_lr=args.adam_lr,
+        nesterov=args.nesterov,
     )
 
 
 def build_run_name(args: argparse.Namespace) -> str:
     model_tag = args.model_name.replace("/", "-")
+    if args.tele_method == "naive":
+        teleport_tag = (
+            f"-ntele{args.n_teleport}-att{args.tele_att}-mlp{args.tele_mlp}"
+            f"-layer{args.tele_layer}-epochs{'_'.join(map(str, args.tele_epoch_array))}"
+        )
+    elif args.tele_method in {"csd_l2_nesterov", "muon_alignment"}:
+        teleport_tag = (
+            f"-cands{args.tele_candidates}-att{args.tele_att}-mlp{args.tele_mlp}"
+            f"-layer{args.tele_layer}-epochs{'_'.join(map(str, args.tele_epoch_array))}"
+        )
+    else:
+        teleport_tag = ""
     return (
         f"WikiText-{args.dataset_config}-{model_tag}-{args.position_embedding}-"
         f"{args.opt}-lr{args.lr}-adam{args.adam_lr}-bs{args.batch_size}-"
-        f"block{args.block_size}-{args.tele_method}-seed{args.seed}"
+        f"block{args.block_size}-{args.tele_method}-nag{int(args.nesterov)}{teleport_tag}-seed{args.seed}"
     )
 
 
@@ -208,10 +221,19 @@ def main() -> None:
     args = parse_args()
     if args.epochs <= 0 or args.batch_size <= 0 or args.eval_batch_size <= 0:
         raise ValueError("epochs and batch sizes must be positive")
-    if args.tele_method == "muon_alignment" and args.opt != "muon":
-        raise ValueError("CSD-Muon teleportation requires --opt muon")
-    if args.tele_method == "muon_alignment" and not (args.tele_att or args.tele_mlp):
-        raise ValueError("Enable --tele-att 1 and/or --tele-mlp 1 for CSD teleportation")
+    if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and args.opt != "muon":
+        raise ValueError("LM teleportation with optimizer-state transport requires --opt muon")
+    if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and not (args.tele_att or args.tele_mlp):
+        raise ValueError("Enable --tele-att 1 and/or --tele-mlp 1 for teleportation")
+    if args.tele_method == "naive" and args.n_teleport < 2:
+        raise ValueError("Naive teleportation requires --n-teleport >= 2")
+    if args.tele_method in {"csd_l2_nesterov", "muon_alignment"} and args.tele_candidates < 2:
+        raise ValueError("Nesterov CSD-L2 requires --tele-candidates >= 2")
+    if args.tele_method in {"csd_l2_nesterov", "muon_alignment"} and not args.nesterov:
+        raise ValueError(
+            "The Nesterov CSD-L2 experiment requires --nesterov so the actual Muon update "
+            "matches the direction used by CSD scoring."
+        )
 
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
@@ -235,6 +257,7 @@ def main() -> None:
         data_dir=args.data_dir,
         cache_dir=args.cache_dir,
         force_retokenize=args.force_retokenize,
+        dataset_source=args.dataset_source,
     )
     data_loading_seconds = time.perf_counter() - data_started
 
@@ -330,14 +353,17 @@ def main() -> None:
         telemetry_table = wandb.Table(
             columns=[
                 "epoch", "batch", "global_step", "method", "accepted", "reason",
-                "search_time_seconds", "alignment_gain", "selected_alignment",
+                "search_time_seconds", "selection_metric", "baseline_score",
+                "selected_score", "score_gain", "gradient_l2_gain", "csd_l2_gain",
                 "selected_candidate_index", "num_candidates_evaluated",
             ]
         )
         candidate_table = wandb.Table(
             columns=[
                 "epoch", "batch", "global_step", "candidate_index", "is_identity",
-                "alignment", "alignment_rank", "scale_min", "scale_max", "transform_type",
+                "selection_metric", "selection_score", "gradient_l2",
+                "csd_l2_score", "csd_l2_squared_score", "csd_l2_rank",
+                "scale_min", "scale_max", "transform_type",
             ]
         )
 
@@ -346,7 +372,7 @@ def main() -> None:
             epoch_started = time.perf_counter()
             model.train()
             tele_scheduler = None
-            if args.tele_method == "muon_alignment" and epoch in args.tele_epoch_array:
+            if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and epoch in args.tele_epoch_array:
                 tele_scheduler = generate_tele_scheduler(
                     tele_batch=args.tele_batch,
                     number_of_batch=len(train_loader),
@@ -380,12 +406,16 @@ def main() -> None:
                         epoch,
                         batch_index,
                         global_step,
-                        info.get("method", "csd_alignment"),
+                        info.get("method", args.tele_method),
                         accepted,
                         info.get("reason", ""),
                         info.get("search_time_seconds", 0.0),
-                        info.get("alignment_gain"),
-                        info.get("selected_alignment"),
+                        info.get("selection_metric"),
+                        info.get("baseline_score"),
+                        info.get("selected_score"),
+                        info.get("score_gain"),
+                        info.get("gradient_l2_gain"),
+                        info.get("csd_l2_gain"),
                         info.get("selected_candidate_index"),
                         info.get("num_candidates_evaluated"),
                     )
@@ -396,8 +426,12 @@ def main() -> None:
                             global_step,
                             candidate.get("candidate_index"),
                             candidate.get("identity"),
-                            candidate.get("alignment"),
-                            candidate.get("alignment_rank"),
+                            info.get("selection_metric"),
+                            candidate.get("selection_score", candidate.get("csd_l2_score")),
+                            candidate.get("gradient_l2"),
+                            candidate.get("csd_l2_score"),
+                            candidate.get("csd_l2_squared_score"),
+                            candidate.get("csd_l2_rank"),
                             candidate.get("scale_min"),
                             candidate.get("scale_max"),
                             candidate.get("transform_type"),
@@ -408,8 +442,16 @@ def main() -> None:
                             "teleport/accepted": accepted_teleports,
                             "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
                             "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
-                            "teleport/alignment_gain": info.get("alignment_gain"),
-                            "teleport/selected_alignment": info.get("selected_alignment"),
+                            "teleport/selection_score": info.get(
+                                "selected_score", info.get("selected_csd_l2_score")
+                            ),
+                            "teleport/score_gain": info.get(
+                                "score_gain", info.get("csd_l2_gain")
+                            ),
+                            "teleport/gradient_l2_gain": info.get("gradient_l2_gain"),
+                            "teleport/selected_gradient_l2": info.get("selected_gradient_l2"),
+                            "teleport/csd_l2_gain": info.get("csd_l2_gain"),
+                            "teleport/selected_csd_l2_score": info.get("selected_csd_l2_score"),
                             "teleport/selected_candidate_index": info.get("selected_candidate_index"),
                             "teleport/accepted_event": int(accepted),
                         },

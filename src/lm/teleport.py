@@ -412,6 +412,7 @@ def create_lm_muon_optimizer(
     momentum: float = 0.9,
     adam_lr: float = 5e-5,
     adam_weight_decay: Optional[float] = None,
+    nesterov: bool = False,
 ) -> torch.optim.Optimizer:
     """Muon for GPT-2 block matrices; AdamW for embeddings, biases and norms."""
     muon_parameters: List[nn.Parameter] = []
@@ -437,6 +438,7 @@ def create_lm_muon_optimizer(
                 "use_muon": True,
                 "lr": float(lr),
                 "momentum": float(momentum),
+                "nesterov": bool(nesterov),
                 "weight_decay": float(weight_decay),
             },
             {
@@ -520,6 +522,7 @@ def _clone_optimizer_for_model(
         weight_decay=float(muon_group.get("weight_decay", 0.0)),
         momentum=float(muon_group.get("momentum", 0.9)),
         adam_lr=float(adam_group["lr"]),
+        nesterov=bool(muon_group.get("nesterov", False)),
         adam_weight_decay=float(adam_group.get("weight_decay", 0.0)),
     )
 
@@ -564,137 +567,14 @@ def try_muon_alignment_teleportation(
     args: Any,
     step_index: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Rank symmetry candidates by the repository's CSD predicted-decrease score."""
-    started = time.perf_counter()
-    rng_state = capture_rng_state()
-    live_snapshot = snapshot_live_state(model, optimizer)
-    low, high = validate_bounds(args.tele_low, args.tele_high)
-    if int(args.tele_candidates) < 2:
-        raise ValueError("--tele-candidates must be >= 2 (identity plus a non-identity candidate)")
-    _muon_groups(optimizer)
-
-    was_training = model.training
-    committed = False
-    model.train()
+    """Backward-compatible alias for Nesterov CSD-L2 teleportation."""
     try:
-        candidates = generate_symmetry_candidates(
-            model=model,
-            args=args,
-            low=low,
-            high=high,
-            count=args.tele_candidates,
-            seed=int(args.seed) + int(step_index),
-        )
-        results: List[Dict[str, Any]] = []
-        for index, candidate in enumerate(candidates):
-            candidate_model, candidate_optimizer = clone_model_and_optimizer(model, optimizer)
-            restore_rng_state(rng_state)
-            if not candidate["identity"]:
-                apply_symmetry_candidate(candidate_model, candidate, args)
-                transport_teleportation_optimizer_state(
-                    candidate_model, candidate_optimizer, candidate, args
-                )
-            candidate_optimizer.zero_grad(set_to_none=True)
-            loss = _loss_for_batch(candidate_model, batch, criterion, args)
-            loss.backward()
-            metrics = _csd_metrics_from_loss(
-                candidate_optimizer, loss, args, step_index=step_index
-            )
-            score = float(metrics["score"])
-            if not math.isfinite(score):
-                raise ValueError(f"Non-finite CSD score for candidate {index}: {score}")
-            results.append(
-                {
-                    "candidate_index": index,
-                    "identity": bool(candidate["identity"]),
-                    "transform_type": candidate["transform_type"],
-                    "scale": candidate["scale_summary"],
-                    "scale_min": float(candidate["scale_min"]),
-                    "scale_max": float(candidate["scale_max"]),
-                    "attention_scale": candidate["attention_scale_summary"],
-                    "mlp_scale": candidate["mlp_scale_summary"],
-                    "alignment": score,
-                    "csd_predicted_decrease": score,
-                    "csd_momentum_dual_norm": float(metrics["momentum_dual_norm"]),
-                    "csd_nesterov_dual_norm": float(metrics["nesterov_dual_norm"]),
-                    "csd_lr_weighted_dual_norm": float(metrics["lr_weighted_dual_norm"]),
-                    "csd_beta": float(metrics["beta"]),
-                    "csd_active_parameters": int(metrics["active_parameters"]),
-                }
-            )
-            # Only one full GPT-2 candidate clone should remain resident at a time.
-            del candidate_model, candidate_optimizer, loss, metrics
-
-        ranked = sorted(
-            results,
-            key=lambda item: (-float(item["csd_predicted_decrease"]), int(item["candidate_index"])),
-        )
-        for rank, item in enumerate(ranked, start=1):
-            item["alignment_rank"] = rank
-        identity_result = next(item for item in results if item["identity"])
-        alternatives = [item for item in results if not item["identity"]]
-        best_alternative = max(alternatives, key=lambda item: item["csd_predicted_decrease"])
-
-        accept_tol = float(getattr(args, "tele_accept_tol", 0.0))
-        if not math.isfinite(accept_tol) or accept_tol < 0:
-            raise ValueError("tele_accept_tol must be finite and nonnegative")
-        identity_score = float(identity_result["csd_predicted_decrease"])
-        accepted = float(best_alternative["csd_predicted_decrease"]) > identity_score + accept_tol
-        selected = best_alternative if accepted else identity_result
-        selected_candidate = candidates[int(selected["candidate_index"])]
-
-        restore_rng_state(rng_state)
-        model.train(was_training)
-        assert_live_state_unchanged(model, optimizer, live_snapshot)
-        if accepted:
-            apply_symmetry_candidate(model, selected_candidate, args)
-            transport_teleportation_optimizer_state(model, optimizer, selected_candidate, args)
-            committed = True
-        search_time = round(time.perf_counter() - started, 6)
-        selected_score = float(selected["csd_predicted_decrease"])
-        telemetry = {
-            "method": "csd_alignment",
-            "accepted": bool(accepted),
-            "reason": (
-                "selected_max_csd_predicted_decrease"
-                if accepted else "identity_selected_no_improvement_over_tolerance"
-            ),
-            "step": int(step_index),
-            "search_time_seconds": search_time,
-            "identity_alignment": identity_score,
-            "selected_alignment": selected_score,
-            "alignment_gain": selected_score - identity_score,
-            "selected_candidate_index": int(selected["candidate_index"]),
-            "selected_identity": not accepted,
-            "selected_scale": selected["scale"],
-            "scale_min": selected["scale_min"],
-            "scale_max": selected["scale_max"],
-            "selected_attention_scale": selected_candidate["attention_scale_summary"],
-            "selected_mlp_scale": selected_candidate["mlp_scale_summary"],
-            "identity_rank": int(identity_result["alignment_rank"]),
-            "state_reset": False,
-            "muon_momentum_reset": False,
-            "auxiliary_adam_state_reset": bool(accepted),
-            "momentum_state_transported": bool(accepted),
-            "selection_objective": "constrained_steepest_descent",
-            "csd_predicted_decrease": selected_score,
-            "csd_momentum_dual_norm": float(selected["csd_momentum_dual_norm"]),
-            "csd_nesterov_dual_norm": float(selected["csd_nesterov_dual_norm"]),
-            "csd_lr_weighted_dual_norm": float(selected["csd_lr_weighted_dual_norm"]),
-            "tele_accept_tol": accept_tol,
-            "tele_layer": args.tele_layer,
-            "transform_family": selected_candidate["transform_type"],
-            "uses_attention": bool(getattr(args, "tele_att", 1)),
-            "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
-            "num_candidates_evaluated": len(results),
-            "results": results,
-        }
-        return bool(accepted), telemetry
-    finally:
-        restore_rng_state(rng_state)
-        model.train(was_training)
-        if not committed:
-            assert_live_state_unchanged(model, optimizer, live_snapshot)
+        from .csd_nesterov import try_csd_l2_nesterov_teleportation
+    except ImportError:  # python src/lm/train.py
+        from csd_nesterov import try_csd_l2_nesterov_teleportation
+    return try_csd_l2_nesterov_teleportation(
+        model, optimizer, batch, criterion, args, step_index
+    )
 
 
 def try_teleportation(
@@ -705,11 +585,12 @@ def try_teleportation(
     args: Any,
     step_index: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    if getattr(args, "tele_method", "muon_alignment") != "muon_alignment":
-        raise ValueError("The GPT-2 CSD trainer supports only --tele-method muon_alignment")
-    return try_muon_alignment_teleportation(
-        model, optimizer, batch, criterion, args, step_index
-    )
+    """Backward-compatible dispatcher to the dedicated LM selection module."""
+    try:
+        from .csd_nesterov import try_teleportation as dispatch
+    except ImportError:  # python src/lm/train.py
+        from csd_nesterov import try_teleportation as dispatch
+    return dispatch(model, optimizer, batch, criterion, args, step_index)
 
 
 __all__ = [

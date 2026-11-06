@@ -1,26 +1,33 @@
-"""Single-device Muon optimizer adapted from Keller Jordan's Muon repository.
+# Copyright (c) 2024 Keller Jordan
+#
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-Copyright (c) 2024 Keller Jordan
+"""Single-device Muon optimizer with optional Nesterov momentum.
 
-MIT License
+The ordinary Muon variant applies Newton--Schulz to the EMA momentum buffer
+B_t. When ``nesterov=True``, it instead applies Newton--Schulz to the
+Nesterov-corrected direction V_t = (1-beta)G_t + beta B_t.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+This switch is deliberately opt-in: the plain and naive LM baselines use
+ordinary Muon, while the Nesterov CSD experiment enables the Nesterov variant.
 """
 
 import torch
@@ -41,9 +48,17 @@ def _zeropower_via_newtonschulz5(gradient, steps=5):
     return update.mT if transposed else update
 
 
-def _muon_update(gradient, momentum_buffer, beta):
+def _muon_update(gradient, momentum_buffer, beta, nesterov=False):
+    """Return the Muon update direction before applying the learning rate."""
     momentum_buffer.lerp_(gradient, 1 - beta)
-    update = gradient.lerp(momentum_buffer, beta)
+    if nesterov:
+        # Matches the repository's CSD-Nesterov definition exactly:
+        # V_t = (1-beta)G_t + beta B_t.
+        update = gradient.lerp(momentum_buffer, beta)
+    else:
+        # Ordinary Muon uses the EMA momentum B_t without look-ahead.
+        update = momentum_buffer
+
     if update.ndim == 4:
         update = update.flatten(1)
     update = _zeropower_via_newtonschulz5(update)
@@ -69,7 +84,10 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
             if group["use_muon"]:
                 group.setdefault("lr", 0.02)
                 group.setdefault("momentum", 0.95)
+                group.setdefault("nesterov", False)
                 group.setdefault("weight_decay", 0)
+                if not isinstance(group["nesterov"], bool):
+                    raise TypeError("Muon group 'nesterov' must be a bool.")
             else:
                 group.setdefault("lr", 3e-4)
                 group.setdefault("betas", (0.9, 0.95))
@@ -97,6 +115,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                         parameter.grad,
                         state["momentum_buffer"],
                         beta=group["momentum"],
+                        nesterov=group["nesterov"],
                     )
                 else:
                     if not state:
@@ -119,8 +138,10 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
         return loss
 
 
-def create_muon_optimizer(model, lr, weight_decay, momentum=0.95, adam_lr=3e-4):
-    """Use Muon for transformer matrix weights and AdamW for the remaining weights."""
+def create_muon_optimizer(
+    model, lr, weight_decay, momentum=0.95, adam_lr=3e-4, nesterov=False
+):
+    """Use Muon for transformer matrix weights and AdamW for other weights."""
     muon_parameters = []
     adam_parameters = []
     adam_only_name_parts = ("embedding", "classifier", "pooler")
@@ -144,6 +165,7 @@ def create_muon_optimizer(model, lr, weight_decay, momentum=0.95, adam_lr=3e-4):
                 "use_muon": True,
                 "lr": lr,
                 "momentum": momentum,
+                "nesterov": bool(nesterov),
                 "weight_decay": weight_decay,
             },
             {
