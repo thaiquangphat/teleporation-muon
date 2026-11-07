@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 
 _LOCAL_SPLIT_NAMES = {
@@ -24,11 +24,7 @@ _LOCAL_SPLIT_NAMES = {
 
 
 class TokenBlockDataset(Dataset):
-    """Non-overlapping input blocks with one-token-ahead targets.
-
-    Token IDs are kept as int32 in host memory (GPT-2's vocabulary fits in
-    int32) and converted to int64 per sample, reducing the resident cache size.
-    """
+    """Non-overlapping input blocks with one-token-ahead targets."""
 
     def __init__(self, token_ids: torch.Tensor, block_size: int):
         if token_ids.ndim != 1:
@@ -61,9 +57,7 @@ def load_gpt2_tokenizer(model_name: str = "gpt2", cache_dir: Optional[str] = Non
     except ImportError as exc:  # pragma: no cover - runtime dependency
         raise ImportError("Install transformers to load the GPT-2 tokenizer") from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, cache_dir=cache_dir, use_fast=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.eos_token_id is None:
@@ -201,7 +195,6 @@ def load_wikitext_token_ids(
             ):
                 return {key: cached[key].to(dtype=torch.int32) for key in expected}
         except (OSError, RuntimeError, ValueError, EOFError):
-            # A partial cache is discarded and rebuilt from the source files.
             pass
 
     if dataset_source == "local":
@@ -243,7 +236,12 @@ def get_wikitext_dataloaders(
     force_retokenize: bool = False,
     pin_memory: bool = True,
     dataset_source: str = "local",
+    train_fraction: float = 1.0,
+    data_seed: int = 42,
 ):
+    if not 0.0 < train_fraction <= 1.0:
+        raise ValueError("train_fraction must be in (0, 1]")
+
     tokenizer = load_gpt2_tokenizer(model_name, cache_dir)
     token_splits = load_wikitext_token_ids(
         dataset_config=dataset_config,
@@ -257,28 +255,39 @@ def get_wikitext_dataloaders(
         split: TokenBlockDataset(tokens, block_size)
         for split, tokens in token_splits.items()
     }
+
+    full_train_dataset = datasets["train"]
+    if train_fraction < 1.0:
+        n_train_blocks = max(1, int(len(full_train_dataset) * train_fraction))
+        generator = torch.Generator()
+        generator.manual_seed(int(data_seed))
+        indices = torch.randperm(
+            len(full_train_dataset), generator=generator
+        )[:n_train_blocks].tolist()
+        datasets["train"] = Subset(full_train_dataset, indices)
+
     common = {
         "num_workers": num_workers,
         "pin_memory": bool(pin_memory and torch.cuda.is_available()),
         "persistent_workers": bool(num_workers > 0),
     }
     train_loader = DataLoader(
-        datasets["train"], batch_size=batch_size, shuffle=True, drop_last=False, **common
+        datasets["train"], batch_size=batch_size, shuffle=True,
+        drop_last=False, **common
     )
     validation_loader = DataLoader(
-        datasets["validation"],
-        batch_size=eval_batch_size,
-        shuffle=False,
-        drop_last=False,
-        **common,
+        datasets["validation"], batch_size=eval_batch_size, shuffle=False,
+        drop_last=False, **common
     )
     test_loader = DataLoader(
-        datasets["test"],
-        batch_size=eval_batch_size,
-        shuffle=False,
-        drop_last=False,
-        **common,
+        datasets["test"], batch_size=eval_batch_size, shuffle=False,
+        drop_last=False, **common
     )
+
     sizes = {f"{split}_tokens": int(tokens.numel()) for split, tokens in token_splits.items()}
     sizes.update({f"{split}_blocks": len(dataset) for split, dataset in datasets.items()})
+    sizes["train_selected_tokens"] = int(len(datasets["train"]) * block_size)
+    sizes["train_selected_blocks"] = int(len(datasets["train"]))
+    sizes["train_fraction"] = float(train_fraction)
+    sizes["train_data_seed"] = int(data_seed)
     return train_loader, validation_loader, test_loader, tokenizer, sizes

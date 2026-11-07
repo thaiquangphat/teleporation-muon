@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fine-tune pretrained GPT-2 on WikiText with regular Muon or CSD-Muon teleportation."""
+"""Step-based GPT-2 training on WikiText with Muon/CSD teleportation."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import math
 import os
 import random
 import time
+import warnings
 from contextlib import nullcontext
 from typing import Optional
 
@@ -31,7 +32,7 @@ def list_of_ints(value: str) -> list[int]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GPT-2 CSD-Muon on WikiText")
+    parser = argparse.ArgumentParser(description="Step-based GPT-2 CSD-Muon on WikiText")
     parser.add_argument("--data-dir", type=str, default="./data/wt103")
     parser.add_argument("--dataset-source", type=str, default="local", choices=["local", "huggingface"])
     parser.add_argument("--cache-dir", type=str, default=None)
@@ -43,13 +44,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--force-retokenize", action="store_true")
+    parser.add_argument(
+        "--train-fraction", type=float, default=1.0,
+        help="Fraction of fixed-length WikiText training blocks to use (e.g. 0.1).",
+    )
+    parser.add_argument("--data-seed", type=int, default=42, help="Seed for the fixed training-block subset")
 
-    parser.add_argument("--epochs", type=int, default=3)
+    # Step-based training is the default. --epochs is retained as a compatibility
+    # option for older scripts; it is converted to epochs * batches_per_epoch
+    # only when --max-steps is not supplied.
+    parser.add_argument("--max-steps", type=int, default=None, help="Total number of optimizer updates (default: 1000)")
+    parser.add_argument("--epochs", type=int, default=None, help="Deprecated compatibility option; converted to steps")
+    parser.add_argument("--log-interval", type=int, default=10, help="Log training metrics every N optimizer steps")
+    parser.add_argument("--eval-interval", type=int, default=100, help="Run validation every N optimizer steps")
+    parser.add_argument("--warmup-steps", type=int, default=0, help="Linear learning-rate warmup steps")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--devices", type=str, default="cuda:0")
-    parser.add_argument("--save_dir", type=str, default="./checkpoints-wikitext")
-    parser.add_argument("--max-train-batches", type=int, default=0)
-    parser.add_argument("--max-eval-batches", type=int, default=0)
+    parser.add_argument("--save-dir", "--save_dir", dest="save_dir", type=str, default="./checkpoints-wikitext")
+    parser.add_argument("--max-train-batches", type=int, default=0, help="Optional cap per data pass; 0 uses the full training loader")
+    parser.add_argument("--max-eval-batches", type=int, default=0, help="Optional cap per evaluation; 0 uses the full split")
     parser.add_argument("--amp-dtype", type=str, default="none", choices=["none", "bfloat16"])
 
     parser.add_argument("--opt", type=str, default="muon", choices=["muon", "adamw"])
@@ -57,16 +70,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adam-lr", type=float, default=5e-5)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument(
-        "--nesterov",
-        action="store_true",
-        help="Use Nesterov-corrected Muon updates (enabled for the CSD-Nesterov experiment only).",
+        "--nesterov", action="store_true",
+        help="Use Nesterov-corrected Muon updates (required for CSD-Nesterov).",
     )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["none", "cosine", "step", "plateau"])
+    parser.add_argument("--lr-min", type=float, default=1e-6, help="Minimum LR for cosine/step schedules")
+    parser.add_argument("--lr-step-size", type=int, default=1000, help="Step-scheduler decay interval after warmup")
+    parser.add_argument("--lr-gamma", type=float, default=0.5, help="Step/plateau scheduler decay factor")
     parser.add_argument("--grad-clip", type=float, default=0.0)
 
     parser.add_argument("--tele-method", type=str, default="none", choices=["none", "naive", "csd_l2_nesterov", "muon_alignment"])
-    parser.add_argument("--tele-epoch-array", type=list_of_ints, default=[1])
+    # Retained to avoid breaking old launch commands. Epoch-gated teleportation
+    # is not used by step-based training; use tele-start-step/tele-limit-step.
+    parser.add_argument("--tele-epoch-array", type=list_of_ints, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--tele-att", type=int, default=1)
     parser.add_argument("--tele-mlp", type=int, default=0)
     parser.add_argument("--tele-layer", type=str, default="all", choices=["all", "first", "last"])
@@ -75,9 +92,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tele-high", type=float, default=1.65)
     parser.add_argument("--tele-low", type=float, default=0.35)
     parser.add_argument("--tele-sign", type=int, default=0)
-    parser.add_argument("--tele-batch", type=int, default=4)
+    parser.add_argument("--tele-batch", type=int, default=4, help="Teleport attempts per teleport scheduling window")
     parser.add_argument("--tele-cons", type=int, default=4)
     parser.add_argument("--tele-opt", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--tele-interval", type=int, default=0, help="Teleport scheduling window in steps; 0 means the full run")
+    parser.add_argument("--tele-start-step", type=int, default=1, help="First eligible optimizer step for teleportation (1-based)")
+    parser.add_argument("--tele-limit-step", type=int, default=0, help="Last eligible step; 0 means no limit")
 
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -141,19 +161,24 @@ def build_run_name(args: argparse.Namespace) -> str:
     if args.tele_method == "naive":
         teleport_tag = (
             f"-ntele{args.n_teleport}-att{args.tele_att}-mlp{args.tele_mlp}"
-            f"-layer{args.tele_layer}-epochs{'_'.join(map(str, args.tele_epoch_array))}"
+            f"-layer{args.tele_layer}-teleint{args.tele_interval}-telebatch{args.tele_batch}"
+            f"-telecons{args.tele_cons}-start{args.tele_start_step}-limit{args.tele_limit_step}"
         )
     elif args.tele_method in {"csd_l2_nesterov", "muon_alignment"}:
         teleport_tag = (
             f"-cands{args.tele_candidates}-att{args.tele_att}-mlp{args.tele_mlp}"
-            f"-layer{args.tele_layer}-epochs{'_'.join(map(str, args.tele_epoch_array))}"
+            f"-layer{args.tele_layer}-teleint{args.tele_interval}-telebatch{args.tele_batch}"
+            f"-telecons{args.tele_cons}-start{args.tele_start_step}-limit{args.tele_limit_step}"
         )
     else:
         teleport_tag = ""
     return (
         f"WikiText-{args.dataset_config}-{model_tag}-{args.position_embedding}-"
         f"{args.opt}-lr{args.lr}-adam{args.adam_lr}-bs{args.batch_size}-"
-        f"block{args.block_size}-{args.tele_method}-nag{int(args.nesterov)}{teleport_tag}-seed{args.seed}"
+        f"block{args.block_size}-frac{args.train_fraction:g}-dseed{args.data_seed}-"
+        f"steps{args.max_steps}-warmup{args.warmup_steps}-eval{args.eval_interval}-"
+        f"sched{args.lr_scheduler}-{args.tele_method}-nag{int(args.nesterov)}"
+        f"{teleport_tag}-seed{args.seed}"
     )
 
 
@@ -172,6 +197,41 @@ def compute_loss(logits: torch.Tensor, targets: torch.Tensor, criterion: nn.Modu
 def synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def apply_step_learning_rates(
+    optimizer: torch.optim.Optimizer,
+    base_lrs: list[float],
+    step: int,
+    args: argparse.Namespace,
+) -> None:
+    """Set warmup/cosine/step learning rates for the upcoming optimizer update."""
+    warmup = int(args.warmup_steps)
+    if warmup > 0 and step <= warmup:
+        scale = float(step) / float(warmup)
+        for group, base_lr in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base_lr * scale
+        return
+
+    if args.lr_scheduler == "plateau":
+        # ReduceLROnPlateau owns the rates after warmup; do not overwrite them.
+        return
+
+    if args.lr_scheduler == "cosine":
+        decay_steps = max(1, int(args.max_steps) - warmup)
+        progress = min(1.0, max(0.0, (step - warmup) / decay_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        for group, base_lr in zip(optimizer.param_groups, base_lrs):
+            min_lr = min(float(args.lr_min), base_lr)
+            group["lr"] = min_lr + (base_lr - min_lr) * cosine
+    elif args.lr_scheduler == "step":
+        decay_steps = max(1, int(args.lr_step_size))
+        num_decays = max(0, (step - warmup) // decay_steps)
+        for group, base_lr in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = max(float(args.lr_min), base_lr * (float(args.lr_gamma) ** num_decays))
+    else:  # none
+        for group, base_lr in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base_lr
 
 
 def evaluate(
@@ -213,8 +273,27 @@ def evaluate(
 
 def main() -> None:
     args = parse_args()
-    if args.epochs <= 0 or args.batch_size <= 0 or args.eval_batch_size <= 0:
-        raise ValueError("epochs and batch sizes must be positive")
+    if args.batch_size <= 0 or args.eval_batch_size <= 0:
+        raise ValueError("batch sizes must be positive")
+    if args.log_interval <= 0 or args.eval_interval <= 0:
+        raise ValueError("log-interval and eval-interval must be positive")
+    if args.max_train_batches < 0 or args.max_eval_batches < 0:
+        raise ValueError("max-train-batches and max-eval-batches must be non-negative")
+    if args.train_fraction <= 0.0 or args.train_fraction > 1.0:
+        raise ValueError("train-fraction must be in (0, 1]")
+    if args.warmup_steps < 0:
+        raise ValueError("warmup-steps must be non-negative")
+    if args.lr_min < 0.0 or args.lr_step_size <= 0 or args.lr_gamma <= 0.0:
+        raise ValueError("lr-min must be non-negative; lr-step-size and lr-gamma must be positive")
+    if args.tele_start_step < 1 or args.tele_limit_step < 0 or args.tele_interval < 0:
+        raise ValueError("tele-start-step must be >= 1; tele-limit-step and tele-interval must be >= 0")
+
+    if args.tele_epoch_array is not None:
+        warnings.warn(
+            "--tele-epoch-array is deprecated and ignored in step-based mode; "
+            "use --tele-start-step, --tele-limit-step, and --tele-interval instead.",
+            stacklevel=2,
+        )
     if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and args.opt != "muon":
         raise ValueError("LM teleportation with optimizer-state transport requires --opt muon")
     if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and not (args.tele_att or args.tele_mlp):
@@ -235,10 +314,6 @@ def main() -> None:
     set_seed(args.seed)
     device = torch.device(args.devices if torch.cuda.is_available() else "cpu")
 
-    run_name = build_run_name(args)
-    save_dir = os.path.join(args.save_dir, run_name)
-    os.makedirs(save_dir, exist_ok=True)
-
     setup_started = time.perf_counter()
     data_started = time.perf_counter()
     train_loader, val_loader, test_loader, tokenizer, data_sizes = get_wikitext_dataloaders(
@@ -252,8 +327,40 @@ def main() -> None:
         cache_dir=args.cache_dir,
         force_retokenize=args.force_retokenize,
         dataset_source=args.dataset_source,
+        train_fraction=args.train_fraction,
+        data_seed=args.data_seed,
     )
     data_loading_seconds = time.perf_counter() - data_started
+
+    if len(train_loader) <= 0:
+        raise RuntimeError("The training loader contains no batches")
+    batches_per_epoch = len(train_loader)
+    if args.max_train_batches > 0:
+        batches_per_epoch = min(batches_per_epoch, args.max_train_batches)
+    if args.max_steps is None:
+        if args.epochs is not None:
+            if args.epochs <= 0:
+                raise ValueError("epochs must be positive when using the deprecated compatibility option")
+            args.max_steps = int(args.epochs) * batches_per_epoch
+            warnings.warn(
+                f"--epochs is deprecated; converted {args.epochs} passes to {args.max_steps} optimizer steps. "
+                "Use --max-steps for new experiments.",
+                stacklevel=2,
+            )
+        else:
+            args.max_steps = 1000
+    elif args.epochs is not None:
+        warnings.warn("Both --max-steps and --epochs were supplied; --max-steps takes precedence.", stacklevel=2)
+    if args.max_steps <= 0:
+        raise ValueError("max-steps must be positive")
+    if args.warmup_steps >= args.max_steps and args.warmup_steps > 0:
+        raise ValueError("warmup-steps must be smaller than max-steps")
+    if args.tele_interval == 0:
+        args.tele_interval = args.max_steps
+
+    run_name = build_run_name(args)
+    save_dir = os.path.join(args.save_dir, run_name)
+    os.makedirs(save_dir, exist_ok=True)
 
     model_started = time.perf_counter()
     model, load_report = GPT2LMForCausalLM.from_pretrained(
@@ -273,25 +380,22 @@ def main() -> None:
         )
     model = model.to(device)
     optimizer = build_optimizer(model, args)
-    model_setup_seconds = time.perf_counter() - model_started
-
-    if args.lr_scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=1e-6
-        )
-    elif args.lr_scheduler == "step":
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
-    elif args.lr_scheduler == "plateau":
+    base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    if args.lr_scheduler == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=1
+            optimizer, mode="min", factor=args.lr_gamma, patience=1,
+            min_lr=args.lr_min,
         )
     else:
         scheduler = None
+    model_setup_seconds = time.perf_counter() - model_started
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     project, entity, mode = load_wandb_settings(args)
     tokenizer.save_pretrained(save_dir)
 
+    selected_train_tokens = int(data_sizes.get("train_selected_tokens", data_sizes.get("train_tokens", 0)))
+    tokens_per_full_batch = args.batch_size * args.block_size
     print("\n========== GPT-2 WIKITEXT CONFIGURATION ==========")
     print("Device:", device)
     print("Position embedding:", args.position_embedding)
@@ -299,7 +403,13 @@ def main() -> None:
     print("Checkpoint load report:", load_report)
     print("Model parameters:", sum(p.numel() for p in model.parameters()))
     print("GPT-2 hidden/layers/heads:", model.config.n_embd, model.config.n_layer, model.config.n_head)
-    print("Train/validation/test blocks:", data_sizes)
+    print("Train/validation/test sizes:", data_sizes)
+    print("Effective train tokens:", selected_train_tokens)
+    print("Train fraction:", args.train_fraction)
+    print("Max optimizer steps:", args.max_steps)
+    print("Tokens per full batch:", tokens_per_full_batch)
+    print("Approx. tokens at max steps:", args.max_steps * tokens_per_full_batch)
+    print("Warmup/evaluation/log intervals:", args.warmup_steps, args.eval_interval, args.log_interval)
     print("=================================================\n")
 
     with wandb.init(
@@ -326,6 +436,9 @@ def main() -> None:
                 "model_heads": model.config.n_head,
                 "dataset_sizes": data_sizes,
                 "pretrained_load_report": load_report,
+                "effective_max_steps": args.max_steps,
+                "effective_train_tokens": selected_train_tokens,
+                "tokens_per_full_optimizer_step": tokens_per_full_batch,
             },
             allow_val_change=True,
         )
@@ -334,16 +447,20 @@ def main() -> None:
                 "timing/data_loading_seconds": data_loading_seconds,
                 "timing/model_setup_seconds": model_setup_seconds,
                 "timing/initialization_seconds": time.perf_counter() - setup_started,
-            }
+            },
+            step=0,
         )
 
         attempted_teleports = 0
         accepted_teleports = 0
         global_step = 0
+        total_processed_tokens = 0
         best_val_loss = float("inf")
+        best_step = 0
         best_epoch = 0
         total_train_seconds = 0.0
         total_validation_seconds = 0.0
+
         telemetry_table = wandb.Table(
             columns=[
                 "epoch", "batch", "global_step", "method", "accepted", "reason",
@@ -361,203 +478,244 @@ def main() -> None:
             ]
         )
 
-        for epoch in range(1, args.epochs + 1):
-            synchronize_device(device)
-            epoch_started = time.perf_counter()
+        tele_scheduler = None
+        if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and args.tele_batch > 0:
+            tele_scheduler = generate_tele_scheduler(
+                tele_batch=args.tele_batch,
+                number_of_batch=args.tele_interval,
+                tele_opt=args.tele_opt,
+                tele_cons=args.tele_cons,
+            )
+
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        train_iterator = iter(train_loader)
+        epoch = 1
+        batch_index_in_epoch = 0
+        interval_loss_sum = 0.0
+        interval_tokens = 0
+        interval_steps = 0
+        interval_started = time.perf_counter()
+
+        progress = tqdm(range(1, args.max_steps + 1), desc="Training", unit="step")
+        for step_number in progress:
+            if batch_index_in_epoch >= batches_per_epoch:
+                epoch += 1
+                batch_index_in_epoch = 0
+                train_iterator = iter(train_loader)
+            try:
+                input_ids, targets = next(train_iterator)
+            except StopIteration:
+                epoch += 1
+                batch_index_in_epoch = 0
+                train_iterator = iter(train_loader)
+                try:
+                    input_ids, targets = next(train_iterator)
+                except StopIteration as exc:
+                    raise RuntimeError("The training loader produced no batches") from exc
+
+            batch_index = batch_index_in_epoch
+            batch_index_in_epoch += 1
+            input_ids = input_ids.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             model.train()
-            tele_scheduler = None
-            if args.tele_method in {"naive", "csd_l2_nesterov", "muon_alignment"} and epoch in args.tele_epoch_array:
-                tele_scheduler = generate_tele_scheduler(
-                    tele_batch=args.tele_batch,
-                    number_of_batch=len(train_loader),
-                    tele_opt=args.tele_opt,
-                    tele_cons=args.tele_cons,
+
+            apply_step_learning_rates(optimizer, base_lrs, step_number, args)
+
+            teleport_is_scheduled = (
+                tele_scheduler is not None
+                and step_number >= args.tele_start_step
+                and (args.tele_limit_step == 0 or step_number <= args.tele_limit_step)
+                and bool(tele_scheduler[(step_number - 1) % args.tele_interval])
+            )
+            if teleport_is_scheduled:
+                accepted, info = try_teleportation(
+                    model=model,
+                    optimizer=optimizer,
+                    batch=(input_ids, targets),
+                    criterion=criterion,
+                    args=args,
+                    step_index=global_step,
                 )
-
-            total_train_loss = 0.0
-            total_train_tokens = 0
-            processed_batches = 0
-            for batch_index, (input_ids, targets) in enumerate(
-                tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")
-            ):
-                if args.max_train_batches > 0 and batch_index >= args.max_train_batches:
-                    break
-                input_ids = input_ids.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-
-                if tele_scheduler is not None and batch_index < len(tele_scheduler) and tele_scheduler[batch_index]:
-                    accepted, info = try_teleportation(
-                        model=model,
-                        optimizer=optimizer,
-                        batch=(input_ids, targets),
-                        criterion=criterion,
-                        args=args,
-                        step_index=global_step,
-                    )
-                    attempted_teleports += 1
-                    accepted_teleports += int(accepted)
-                    telemetry_table.add_data(
+                attempted_teleports += 1
+                accepted_teleports += int(accepted)
+                telemetry_table.add_data(
+                    epoch,
+                    batch_index,
+                    step_number,
+                    info.get("method", args.tele_method),
+                    accepted,
+                    info.get("reason", ""),
+                    info.get("search_time_seconds", 0.0),
+                    info.get("selection_metric"),
+                    info.get("baseline_score"),
+                    info.get("selected_score"),
+                    info.get("score_gain"),
+                    info.get("gradient_l2_gain"),
+                    info.get("csd_l2_gain"),
+                    info.get("selected_candidate_index"),
+                    info.get("num_candidates_evaluated"),
+                )
+                for candidate in info.get("results", []):
+                    candidate_table.add_data(
                         epoch,
                         batch_index,
-                        global_step,
-                        info.get("method", args.tele_method),
-                        accepted,
-                        info.get("reason", ""),
-                        info.get("search_time_seconds", 0.0),
+                        step_number,
+                        candidate.get("candidate_index"),
+                        candidate.get("identity"),
                         info.get("selection_metric"),
-                        info.get("baseline_score"),
-                        info.get("selected_score"),
-                        info.get("score_gain"),
-                        info.get("gradient_l2_gain"),
-                        info.get("csd_l2_gain"),
-                        info.get("selected_candidate_index"),
-                        info.get("num_candidates_evaluated"),
+                        candidate.get("selection_score", candidate.get("csd_l2_score")),
+                        candidate.get("gradient_l2"),
+                        candidate.get("csd_l2_score"),
+                        candidate.get("csd_l2_squared_score"),
+                        candidate.get("csd_l2_rank"),
+                        candidate.get("scale_min"),
+                        candidate.get("scale_max"),
+                        candidate.get("transform_type"),
                     )
-                    for candidate in info.get("results", []):
-                        candidate_table.add_data(
-                            epoch,
-                            batch_index,
-                            global_step,
-                            candidate.get("candidate_index"),
-                            candidate.get("identity"),
-                            info.get("selection_metric"),
-                            candidate.get("selection_score", candidate.get("csd_l2_score")),
-                            candidate.get("gradient_l2"),
-                            candidate.get("csd_l2_score"),
-                            candidate.get("csd_l2_squared_score"),
-                            candidate.get("csd_l2_rank"),
-                            candidate.get("scale_min"),
-                            candidate.get("scale_max"),
-                            candidate.get("transform_type"),
-                        )
-                    run.log(
-                        {
-                            "teleport/attempted": attempted_teleports,
-                            "teleport/accepted": accepted_teleports,
-                            "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
-                            "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
-                            "teleport/selection_score": info.get(
-                                "selected_score", info.get("selected_csd_l2_score")
-                            ),
-                            "teleport/score_gain": info.get(
-                                "score_gain", info.get("csd_l2_gain")
-                            ),
-                            "teleport/gradient_l2_gain": info.get("gradient_l2_gain"),
-                            "teleport/selected_gradient_l2": info.get("selected_gradient_l2"),
-                            "teleport/csd_l2_gain": info.get("csd_l2_gain"),
-                            "teleport/selected_csd_l2_score": info.get("selected_csd_l2_score"),
-                            "teleport/selected_candidate_index": info.get("selected_candidate_index"),
-                            "teleport/accepted_event": int(accepted),
-                        },
-                        step=global_step,
-                    )
-
-                optimizer.zero_grad(set_to_none=True)
-                with autocast_context(args, device):
-                    logits = model(input_ids=input_ids).logits
-                    loss = compute_loss(logits, targets, criterion)
-                loss.backward()
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
-
-                token_count = int(targets.numel())
-                total_train_loss += float(loss.item()) * token_count
-                total_train_tokens += token_count
-                processed_batches += 1
-                global_step += 1
                 run.log(
                     {
-                        "train/batch_loss": float(loss.item()),
-                        "train/batch_perplexity": math.exp(min(float(loss.item()), 20.0)),
-                        "train/tokens": token_count,
+                        "teleport/attempted": attempted_teleports,
+                        "teleport/accepted": accepted_teleports,
+                        "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
+                        "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
+                        "teleport/selection_score": info.get("selected_score", info.get("selected_csd_l2_score")),
+                        "teleport/score_gain": info.get("score_gain", info.get("csd_l2_gain")),
+                        "teleport/gradient_l2_gain": info.get("gradient_l2_gain"),
+                        "teleport/selected_gradient_l2": info.get("selected_gradient_l2"),
+                        "teleport/csd_l2_gain": info.get("csd_l2_gain"),
+                        "teleport/selected_csd_l2_score": info.get("selected_csd_l2_score"),
+                        "teleport/selected_candidate_index": info.get("selected_candidate_index"),
+                        "teleport/accepted_event": int(accepted),
+                    },
+                    step=step_number,
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(args, device):
+                logits = model(input_ids=input_ids).logits
+                loss = compute_loss(logits, targets, criterion)
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+
+            token_count = int(targets.numel())
+            loss_value = float(loss.detach().float().item())
+            interval_loss_sum += loss_value * token_count
+            interval_tokens += token_count
+            interval_steps += 1
+            total_processed_tokens += token_count
+            global_step = step_number
+
+            progress.set_postfix(
+                loss=f"{loss_value:.3f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                epoch=epoch,
+            )
+
+            should_log = (global_step % args.log_interval == 0) or (global_step == args.max_steps)
+            should_eval = (global_step % args.eval_interval == 0) or (global_step == args.max_steps)
+            if should_log or should_eval:
+                synchronize_device(device)
+                elapsed = max(time.perf_counter() - interval_started, 1e-9)
+                total_train_seconds += elapsed
+                if interval_tokens > 0:
+                    interval_loss = interval_loss_sum / interval_tokens
+                    train_log = {
+                        "train/loss": interval_loss,
+                        "train/perplexity": math.exp(min(interval_loss, 20.0)),
+                        "train/interval_tokens": interval_tokens,
+                        "train/processed_tokens": total_processed_tokens,
+                        "train/tokens_per_second": interval_tokens / elapsed,
+                        "train/steps_per_second": interval_steps / elapsed,
+                        "train/epoch": epoch,
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        "train/muon_learning_rate": optimizer.param_groups[0]["lr"],
-                        **(
-                            {"train/adam_learning_rate": optimizer.param_groups[1]["lr"]}
-                            if args.opt == "muon" else {}
+                    }
+                    if args.opt == "muon":
+                        train_log["train/muon_learning_rate"] = optimizer.param_groups[0]["lr"]
+                        train_log["train/adam_learning_rate"] = optimizer.param_groups[1]["lr"]
+                    else:
+                        train_log["train/adamw_learning_rate"] = optimizer.param_groups[0]["lr"]
+                    run.log(train_log, step=global_step)
+                    interval_loss_sum = 0.0
+                    interval_tokens = 0
+                    interval_steps = 0
+                if not should_eval:
+                    interval_started = time.perf_counter()
+
+            if should_eval:
+                validation_started = time.perf_counter()
+                val_metrics = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    criterion,
+                    args,
+                    desc=f"[Step {global_step}/{args.max_steps}] Validation",
+                )
+                synchronize_device(device)
+                validation_seconds = time.perf_counter() - validation_started
+                total_validation_seconds += validation_seconds
+
+                if scheduler is not None and global_step >= args.warmup_steps:
+                    scheduler.step(val_metrics["loss"])
+
+                checkpoint = {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                    "epoch": epoch,
+                    "batch_index_in_epoch": batch_index_in_epoch,
+                    "global_step": global_step,
+                    "processed_tokens": total_processed_tokens,
+                    "validation_loss": val_metrics["loss"],
+                    "validation_perplexity": val_metrics["perplexity"],
+                    "model_config": model.config_dict(),
+                    "position_embedding": args.position_embedding,
+                    "model_name": args.model_name,
+                    "args": vars(args),
+                }
+                torch.save(checkpoint, os.path.join(save_dir, "last.pt"))
+                if val_metrics["loss"] < best_val_loss:
+                    best_val_loss = val_metrics["loss"]
+                    best_step = global_step
+                    best_epoch = epoch
+                    torch.save(checkpoint, os.path.join(save_dir, "best.pt"))
+
+                run.log(
+                    {
+                        "global_step": global_step,
+                        "processed_tokens": total_processed_tokens,
+                        "validation/loss": val_metrics["loss"],
+                        "validation/perplexity": val_metrics["perplexity"],
+                        "validation/tokens": val_metrics["tokens"],
+                        "validation/batches": val_metrics["batches"],
+                        "best/validation_loss": best_val_loss,
+                        "best/validation_perplexity": math.exp(min(best_val_loss, 20.0)),
+                        "best/step": best_step,
+                        "best/epoch": best_epoch,
+                        "timing/validation_seconds": validation_seconds,
+                        "teleport/attempted": attempted_teleports,
+                        "teleport/accepted": accepted_teleports,
+                        "teleport/acceptance_rate": accepted_teleports / attempted_teleports if attempted_teleports else 0.0,
+                        "system/gpu_peak_memory_mb": (
+                            torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                            if device.type == "cuda" else 0.0
                         ),
                     },
                     step=global_step,
                 )
-
-            if processed_batches == 0:
-                raise RuntimeError("The training loader produced no batches")
-            synchronize_device(device)
-            train_seconds = time.perf_counter() - epoch_started
-            total_train_seconds += train_seconds
-            train_loss = total_train_loss / max(total_train_tokens, 1)
-
-            validation_started = time.perf_counter()
-            val_metrics = evaluate(
-                model, val_loader, device, criterion, args,
-                desc=f"[Epoch {epoch}/{args.epochs}] Validation",
-            )
-            synchronize_device(device)
-            validation_seconds = time.perf_counter() - validation_started
-            total_validation_seconds += validation_seconds
-
-            checkpoint = {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-                "epoch": epoch,
-                "global_step": global_step,
-                "train_loss": train_loss,
-                "validation_loss": val_metrics["loss"],
-                "validation_perplexity": val_metrics["perplexity"],
-                "model_config": model.config_dict(),
-                "position_embedding": args.position_embedding,
-                "model_name": args.model_name,
-                "args": vars(args),
-            }
-            torch.save(checkpoint, os.path.join(save_dir, "last.pt"))
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                best_epoch = epoch
-                torch.save(checkpoint, os.path.join(save_dir, "best.pt"))
-
-            if scheduler is not None:
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_metrics["loss"])
-                else:
-                    scheduler.step()
-
-            run.log(
-                {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "train/epoch_loss": train_loss,
-                    "train/epoch_perplexity": math.exp(min(train_loss, 20.0)),
-                    "train/tokens": total_train_tokens,
-                    "train/batches": processed_batches,
-                    "train/tokens_per_second": total_train_tokens / max(train_seconds, 1e-9),
-                    "validation/loss": val_metrics["loss"],
-                    "validation/perplexity": val_metrics["perplexity"],
-                    "validation/tokens": val_metrics["tokens"],
-                    "best/validation_loss": best_val_loss,
-                    "best/validation_perplexity": math.exp(min(best_val_loss, 20.0)),
-                    "best/epoch": best_epoch,
-                    "timing/train_seconds": train_seconds,
-                    "timing/validation_seconds": validation_seconds,
-                    "timing/epoch_seconds": time.perf_counter() - epoch_started,
-                    "teleport/attempted": attempted_teleports,
-                    "teleport/accepted": accepted_teleports,
-                    "teleport/acceptance_rate": accepted_teleports / attempted_teleports if attempted_teleports else 0.0,
-                    "system/gpu_peak_memory_mb": (
-                        torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-                        if device.type == "cuda" else 0.0
-                    ),
-                },
-                step=global_step,
-            )
-            if device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                interval_started = time.perf_counter()
+                model.train()
 
         best_checkpoint_path = os.path.join(save_dir, "best.pt")
-        if os.path.isfile(best_checkpoint_path):
-            best_checkpoint = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
-            model.load_state_dict(best_checkpoint["model_state_dict"])
+        if not os.path.isfile(best_checkpoint_path):
+            raise RuntimeError("No best validation checkpoint was saved")
+        best_checkpoint = torch.load(best_checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(best_checkpoint["model_state_dict"])
         test_metrics = evaluate(
             model, test_loader, device, criterion, args, desc="Final test evaluation"
         )
@@ -566,15 +724,18 @@ def main() -> None:
                 "test/loss": test_metrics["loss"],
                 "test/perplexity": test_metrics["perplexity"],
                 "test/tokens": test_metrics["tokens"],
-                "test/best_checkpoint_epoch": best_epoch,
+                "test/best_checkpoint_step": best_step,
             },
             step=global_step,
         )
         run.log({"teleport/events": telemetry_table, "teleport/candidates": candidate_table})
         run.summary["best/validation_loss"] = best_val_loss
         run.summary["best/validation_perplexity"] = math.exp(min(best_val_loss, 20.0))
+        run.summary["best/step"] = best_step
         run.summary["best/epoch"] = best_epoch
         run.summary["test/perplexity"] = test_metrics["perplexity"]
+        run.summary["total/optimizer_steps"] = global_step
+        run.summary["total/processed_tokens"] = total_processed_tokens
         run.summary["teleport/attempted"] = attempted_teleports
         run.summary["teleport/accepted"] = accepted_teleports
         run.summary["timing/total_train_seconds"] = total_train_seconds
