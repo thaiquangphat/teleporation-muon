@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import math
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -64,8 +64,8 @@ def nesterov_csd_l2_metrics(optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
     the candidate score.
     """
     groups = _muon_groups(optimizer)
-    squared_norm_sum = 0.0
-    nuclear_norms: List[float] = []
+    nuclear_norm_tensors: List[torch.Tensor] = []
+    matrix_names: List[str] = []
     beta_values: list[float] = []
 
     for group in groups:
@@ -89,31 +89,66 @@ def nesterov_csd_l2_metrics(optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
                 # First optimizer step: B_{t-1}=0.
                 direction = gradient.mul(gradient_weight)
 
-            nuclear_norm = float(
-                torch.linalg.matrix_norm(_muon_matrix_view(direction), ord="nuc").item()
+            nuclear_norm = torch.linalg.matrix_norm(_muon_matrix_view(direction), ord="nuc")
+            nuclear_norm_tensors.append(nuclear_norm)
+            parameter_name = getattr(optimizer, "parameter_names", {}).get(
+                id(parameter), f"parameter_{len(matrix_names)}"
             )
-            if not math.isfinite(nuclear_norm):
-                raise ValueError("Nesterov CSD-L2 produced a non-finite nuclear norm")
-            nuclear_norms.append(nuclear_norm)
-            squared_norm_sum += nuclear_norm * nuclear_norm
+            matrix_names.append(str(parameter_name))
 
-    if not nuclear_norms:
+    if not nuclear_norm_tensors:
         raise RuntimeError(
             "No Muon matrix parameters received gradients; cannot compute Nesterov CSD-L2"
         )
     if any(abs(value - beta_values[0]) > 1e-12 for value in beta_values[1:]):
         raise ValueError("CSD scoring requires a common Muon momentum coefficient")
 
+    nuclear_norms = torch.stack(nuclear_norm_tensors).detach().cpu().tolist()
+    if not all(math.isfinite(float(value)) for value in nuclear_norms):
+        raise ValueError("Nesterov CSD-L2 produced a non-finite nuclear norm")
+    squared_norm_sum = sum(float(value) ** 2 for value in nuclear_norms)
     return {
         "score": float(math.sqrt(squared_norm_sum)),
         "squared_score": float(squared_norm_sum),
         "matrix_count": len(nuclear_norms),
-        "matrix_nuclear_norms": nuclear_norms,
+        "matrix_nuclear_norms": [float(value) for value in nuclear_norms],
+        "matrix_names": matrix_names,
         "max_matrix_nuclear_norm": max(nuclear_norms),
         "sum_matrix_nuclear_norms": sum(nuclear_norms),
         "beta": beta_values[0],
         "momentum_direction": "nesterov_corrected_pre_newton_schulz",
     }
+
+
+
+
+def _rankdata(values: List[float]) -> List[float]:
+    """Average ranks (1-based) for Spearman correlation, including ties."""
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [0.0] * len(values)
+    cursor = 0
+    while cursor < len(order):
+        end = cursor + 1
+        while end < len(order) and values[order[end]] == values[order[cursor]]:
+            end += 1
+        average_rank = 0.5 * ((cursor + 1) + end)
+        for position in range(cursor, end):
+            ranks[order[position]] = average_rank
+        cursor = end
+    return ranks
+
+
+def _spearman_correlation(left: List[float], right: List[float]) -> Optional[float]:
+    if len(left) != len(right) or len(left) < 2:
+        return None
+    x = torch.tensor(_rankdata(left), dtype=torch.float64)
+    y = torch.tensor(_rankdata(right), dtype=torch.float64)
+    x = x - x.mean()
+    y = y - y.mean()
+    denominator = torch.linalg.vector_norm(x) * torch.linalg.vector_norm(y)
+    if denominator.item() <= 1e-12:
+        return None
+    return float((torch.dot(x, y) / denominator).item())
 
 
 def try_csd_l2_nesterov_teleportation(
@@ -184,6 +219,23 @@ def try_csd_l2_nesterov_teleportation(
             if not math.isfinite(score):
                 raise ValueError(f"Non-finite Nesterov CSD-L2 score for candidate {index}")
 
+            # Optional expensive diagnostic: run one virtual optimizer update
+            # on each candidate clone, then evaluate the same batch in eval
+            # mode. The live model/optimizer and candidate selection remain
+            # untouched by this diagnostic rollout.
+            post_step_loss = None
+            if bool(getattr(args, "diagnostics_candidate_rollout", False)):
+                candidate_optimizer.step()
+                candidate_was_training = candidate_model.training
+                candidate_model.eval()
+                try:
+                    with torch.no_grad():
+                        post_step_loss = float(
+                            _loss_for_batch(candidate_model, batch, criterion, args).detach().float().item()
+                        )
+                finally:
+                    candidate_model.train(candidate_was_training)
+
             results.append(
                 {
                     "candidate_index": index,
@@ -206,7 +258,9 @@ def try_csd_l2_nesterov_teleportation(
                         metrics["sum_matrix_nuclear_norms"]
                     ),
                     "csd_l2_matrix_nuclear_norms": metrics["matrix_nuclear_norms"],
+                    "csd_l2_matrix_names": metrics["matrix_names"],
                     "csd_l2_momentum_direction": metrics["momentum_direction"],
+                    "post_step_loss": post_step_loss,
                     "csd_l2_rank": None,
                     "alignment_rank": None,
                 }
@@ -252,6 +306,25 @@ def try_csd_l2_nesterov_teleportation(
         identity_score = float(identity_result["csd_l2_score"])
         selected_score = float(selected["csd_l2_score"])
         gain = selected_score - identity_score
+        identity_post_loss = identity_result.get("post_step_loss")
+        selected_post_loss = selected.get("post_step_loss")
+        post_loss_gain = (
+            float(identity_post_loss) - float(selected_post_loss)
+            if identity_post_loss is not None and selected_post_loss is not None else None
+        )
+        candidate_post_losses = [item.get("post_step_loss") for item in results]
+        score_post_loss_spearman = None
+        best_post_step_candidate_index = None
+        if all(value is not None for value in candidate_post_losses):
+            actual_improvements = [float(identity_post_loss) - float(value) for value in candidate_post_losses]
+            score_post_loss_spearman = _spearman_correlation(
+                [float(item["csd_l2_score"]) for item in results], actual_improvements
+            )
+            best_post_step_candidate_index = min(
+                results, key=lambda item: float(item["post_step_loss"])
+            )["candidate_index"]
+        sorted_scores = sorted((float(item["csd_l2_score"]) for item in results), reverse=True)
+        score_margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) > 1 else 0.0
         telemetry = {
             "method": "csd_l2_nesterov",
             "selection_metric": "nesterov_csd_l2",
@@ -294,11 +367,17 @@ def try_csd_l2_nesterov_teleportation(
             "csd_l2_matrix_nuclear_norms": selected[
                 "csd_l2_matrix_nuclear_norms"
             ],
+            "csd_l2_matrix_names": selected["csd_l2_matrix_names"],
             "tele_layer": args.tele_layer,
             "transform_family": selected_candidate["transform_type"],
             "uses_attention": bool(getattr(args, "tele_att", 1)),
             "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
-            "post_loss_gain": None,
+            "post_loss_gain": post_loss_gain,
+            "identity_post_step_loss": identity_post_loss,
+            "selected_post_step_loss": selected_post_loss,
+            "best_post_step_candidate_index": best_post_step_candidate_index,
+            "candidate_score_post_loss_spearman": score_post_loss_spearman,
+            "candidate_score_margin": float(score_margin),
             "proposed_candidate_index": int(best_alternative["candidate_index"]),
             "accepted_candidate_index": selected_index if accepted else None,
             "num_candidates_evaluated": len(results),

@@ -22,6 +22,20 @@ from datamodule import get_wikitext_dataloaders
 from model import GPT2LMForCausalLM
 from teleport import create_lm_muon_optimizer, generate_tele_scheduler
 from csd_nesterov import try_teleportation
+from diagnostics import (
+    GPT2ActivationRecorder,
+    build_tensor_snapshot,
+    collect_csd_diagnostics,
+    collect_gradient_geometry,
+    collect_global_gradient_metrics,
+    collect_weight_geometry,
+    collect_weight_tensors,
+    compare_weight_snapshots,
+    diagnostic_layer_indices,
+    log_tensor_artifact,
+    log_tensor_visuals,
+    optimizer_diagnostic_metrics,
+)
 
 
 def list_of_ints(value: str) -> list[int]:
@@ -101,6 +115,23 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-entity", type=str, default=None)
+    # Research diagnostics. Zero disables the corresponding periodic collector.
+    parser.add_argument("--diagnostics-interval", type=int, default=100,
+                        help="Collect matrix/activation/gradient/optimizer diagnostics every N steps; 0 disables periodic diagnostics.")
+    parser.add_argument("--diagnostics-spectrum-interval", type=int, default=500,
+                        help="Run exact singular-value/rank diagnostics every N steps; 0 disables exact spectra.")
+    parser.add_argument("--diagnostics-csd-interval", type=int, default=100,
+                        help="Collect per-matrix CSD dual-norm contributions every N steps; 0 disables this collector.")
+    parser.add_argument("--diagnostics-tensor-interval", type=int, default=500,
+                        help="Save exact matrix/activation tensors as W&B artifacts every N steps; 0 disables periodic artifacts.")
+    parser.add_argument("--diagnostics-artifact-on-teleport", action=argparse.BooleanOptionalAction, default=True,
+                        help="Save before/after tensors on accepted teleportations.")
+    parser.add_argument("--diagnostics-snapshot-layers", type=int, default=1,
+                        help="Number of representative transformer layers (middle by default; first/middle/last when >1) in tensor artifacts and exact spectra.")
+    parser.add_argument("--diagnostics-function-check", action=argparse.BooleanOptionalAction, default=True,
+                        help="Check sampled logits before/after each attempted teleportation in eval mode.")
+    parser.add_argument("--diagnostics-candidate-rollout", action=argparse.BooleanOptionalAction, default=False,
+                        help="Expensive: take one virtual Muon update for every CSD candidate and compare post-step loss.")
     parser.add_argument("--wandb-mode", type=str, choices=["online", "offline", "disabled"], default=None)
     return parser.parse_args()
 
@@ -192,6 +223,35 @@ def autocast_context(args: argparse.Namespace, device: torch.device):
 
 def compute_loss(logits: torch.Tensor, targets: torch.Tensor, criterion: nn.Module) -> torch.Tensor:
     return criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+
+def sampled_logits_for_function_check(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample a few token-position logits without retaining the full LM logits."""
+    was_training = model.training
+    model.eval()
+    seq_len = int(input_ids.shape[1])
+    positions = sorted({0, seq_len // 2, max(0, seq_len - 1)})
+    try:
+        with torch.no_grad(), autocast_context(args, device):
+            logits = model(input_ids=input_ids[:1]).logits
+            return logits[0, positions, :].detach().float().clone()
+    finally:
+        model.train(was_training)
+
+
+def function_preservation_metrics(before: torch.Tensor, after: torch.Tensor) -> dict[str, float]:
+    difference = after.float() - before.float()
+    denominator = torch.linalg.vector_norm(before.float()).clamp_min(1e-12)
+    return {
+        "teleport/function_relative_logit_error": float((torch.linalg.vector_norm(difference) / denominator).item()),
+        "teleport/function_max_abs_logit_error": float(difference.abs().max().item()),
+        "teleport/function_rms_logit_error": float(difference.square().mean().sqrt().item()),
+    }
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -287,6 +347,14 @@ def main() -> None:
         raise ValueError("lr-min must be non-negative; lr-step-size and lr-gamma must be positive")
     if args.tele_start_step < 1 or args.tele_limit_step < 0 or args.tele_interval < 0:
         raise ValueError("tele-start-step must be >= 1; tele-limit-step and tele-interval must be >= 0")
+    diagnostic_intervals = (
+        args.diagnostics_interval, args.diagnostics_spectrum_interval,
+        args.diagnostics_csd_interval, args.diagnostics_tensor_interval,
+    )
+    if any(value < 0 for value in diagnostic_intervals):
+        raise ValueError("diagnostic intervals must be non-negative")
+    if args.diagnostics_snapshot_layers <= 0:
+        raise ValueError("diagnostics-snapshot-layers must be positive")
 
     if args.tele_epoch_array is not None:
         warnings.warn(
@@ -379,6 +447,9 @@ def main() -> None:
             f"vocabulary ({model.config.vocab_size}). Avoid adding tokenizer tokens."
         )
     model = model.to(device)
+    activation_recorder = GPT2ActivationRecorder(
+        model, layer_indices=diagnostic_layer_indices(model, args.diagnostics_snapshot_layers)
+    )
     optimizer = build_optimizer(model, args)
     base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
     if args.lr_scheduler == "plateau":
@@ -439,6 +510,12 @@ def main() -> None:
                 "effective_max_steps": args.max_steps,
                 "effective_train_tokens": selected_train_tokens,
                 "tokens_per_full_optimizer_step": tokens_per_full_batch,
+                "diagnostics_enabled": bool(
+                    args.diagnostics_interval or args.diagnostics_spectrum_interval
+                    or args.diagnostics_csd_interval or args.diagnostics_tensor_interval
+                    or args.diagnostics_artifact_on_teleport
+                ),
+                "diagnostics_snapshot_layers": diagnostic_layer_indices(model, args.diagnostics_snapshot_layers),
             },
             allow_val_change=True,
         )
@@ -467,6 +544,8 @@ def main() -> None:
                 "search_time_seconds", "selection_metric", "baseline_score",
                 "selected_score", "score_gain", "gradient_l2_gain", "csd_l2_gain",
                 "selected_candidate_index", "num_candidates_evaluated",
+                "post_loss_gain", "candidate_score_post_loss_spearman", "candidate_score_margin",
+                "function_relative_logit_error",
             ]
         )
         candidate_table = wandb.Table(
@@ -474,7 +553,7 @@ def main() -> None:
                 "epoch", "batch", "global_step", "candidate_index", "is_identity",
                 "selection_metric", "selection_score", "gradient_l2",
                 "csd_l2_score", "csd_l2_squared_score", "csd_l2_rank",
-                "scale_min", "scale_max", "transform_type",
+                "scale_min", "scale_max", "transform_type", "post_step_loss",
             ]
         )
 
@@ -528,7 +607,23 @@ def main() -> None:
                 and (args.tele_limit_step == 0 or step_number <= args.tele_limit_step)
                 and bool(tele_scheduler[(step_number - 1) % args.tele_interval])
             )
+            teleport_info = None
+            accepted_teleport_event = False
+            pre_teleport_weights = None
+            pre_teleport_sampled_logits = None
+            function_check_metrics = {}
+            snapshot_layers = diagnostic_layer_indices(model, args.diagnostics_snapshot_layers)
             if teleport_is_scheduled:
+                # Save only representative exact matrices; full GPT-2 snapshots
+                # across every layer can be very large.
+                if args.diagnostics_artifact_on_teleport:
+                    pre_teleport_weights = collect_weight_tensors(
+                        model, layer_indices=snapshot_layers, clone=True
+                    )
+                if args.diagnostics_function_check:
+                    pre_teleport_sampled_logits = sampled_logits_for_function_check(
+                        model, input_ids, args, device
+                    )
                 accepted, info = try_teleportation(
                     model=model,
                     optimizer=optimizer,
@@ -537,6 +632,24 @@ def main() -> None:
                     args=args,
                     step_index=global_step,
                 )
+                teleport_info = info
+                accepted_teleport_event = bool(accepted)
+                if accepted and pre_teleport_sampled_logits is not None:
+                    post_teleport_sampled_logits = sampled_logits_for_function_check(
+                        model, input_ids, args, device
+                    )
+                    function_check_metrics = function_preservation_metrics(
+                        pre_teleport_sampled_logits, post_teleport_sampled_logits
+                    )
+                    info.update(function_check_metrics)
+                elif pre_teleport_sampled_logits is not None:
+                    function_check_metrics = {
+                        "teleport/function_relative_logit_error": 0.0,
+                        "teleport/function_max_abs_logit_error": 0.0,
+                        "teleport/function_rms_logit_error": 0.0,
+                    }
+                    info.update(function_check_metrics)
+
                 attempted_teleports += 1
                 accepted_teleports += int(accepted)
                 telemetry_table.add_data(
@@ -555,6 +668,10 @@ def main() -> None:
                     info.get("csd_l2_gain"),
                     info.get("selected_candidate_index"),
                     info.get("num_candidates_evaluated"),
+                    info.get("post_loss_gain"),
+                    info.get("candidate_score_post_loss_spearman"),
+                    info.get("candidate_score_margin"),
+                    info.get("teleport/function_relative_logit_error"),
                 )
                 for candidate in info.get("results", []):
                     candidate_table.add_data(
@@ -572,24 +689,50 @@ def main() -> None:
                         candidate.get("scale_min"),
                         candidate.get("scale_max"),
                         candidate.get("transform_type"),
+                        candidate.get("post_step_loss"),
                     )
-                run.log(
-                    {
-                        "teleport/attempted": attempted_teleports,
-                        "teleport/accepted": accepted_teleports,
-                        "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
-                        "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
-                        "teleport/selection_score": info.get("selected_score", info.get("selected_csd_l2_score")),
-                        "teleport/score_gain": info.get("score_gain", info.get("csd_l2_gain")),
-                        "teleport/gradient_l2_gain": info.get("gradient_l2_gain"),
-                        "teleport/selected_gradient_l2": info.get("selected_gradient_l2"),
-                        "teleport/csd_l2_gain": info.get("csd_l2_gain"),
-                        "teleport/selected_csd_l2_score": info.get("selected_csd_l2_score"),
-                        "teleport/selected_candidate_index": info.get("selected_candidate_index"),
-                        "teleport/accepted_event": int(accepted),
-                    },
-                    step=step_number,
-                )
+                event_log = {
+                    "teleport/attempted": attempted_teleports,
+                    "teleport/accepted": accepted_teleports,
+                    "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
+                    "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
+                    "teleport/selection_score": info.get("selected_score", info.get("selected_csd_l2_score")),
+                    "teleport/score_gain": info.get("score_gain", info.get("csd_l2_gain")),
+                    "teleport/gradient_l2_gain": info.get("gradient_l2_gain"),
+                    "teleport/selected_gradient_l2": info.get("selected_gradient_l2"),
+                    "teleport/csd_l2_gain": info.get("csd_l2_gain"),
+                    "teleport/selected_csd_l2_score": info.get("selected_csd_l2_score"),
+                    "teleport/selected_candidate_index": info.get("selected_candidate_index"),
+                    "teleport/accepted_event": int(accepted),
+                    "teleport/post_loss_gain": info.get("post_loss_gain"),
+                    "teleport/candidate_score_post_loss_spearman": info.get("candidate_score_post_loss_spearman"),
+                    "teleport/candidate_score_margin": info.get("candidate_score_margin"),
+                    **function_check_metrics,
+                }
+                run.log({key: value for key, value in event_log.items() if value is not None}, step=step_number)
+
+            periodic_diagnostics = (
+                args.diagnostics_interval > 0 and step_number % args.diagnostics_interval == 0
+            )
+            spectrum_diagnostics = (
+                args.diagnostics_spectrum_interval > 0
+                and step_number % args.diagnostics_spectrum_interval == 0
+            )
+            csd_diagnostics_due = (
+                args.diagnostics_csd_interval > 0 and step_number % args.diagnostics_csd_interval == 0
+            )
+            tensor_snapshot_due = (
+                args.diagnostics_tensor_interval > 0
+                and step_number % args.diagnostics_tensor_interval == 0
+            ) or (accepted_teleport_event and args.diagnostics_artifact_on_teleport)
+            should_diagnose = (
+                periodic_diagnostics or spectrum_diagnostics or csd_diagnostics_due
+                or tensor_snapshot_due or teleport_is_scheduled
+            )
+            activation_recorder.clear()
+            activation_recorder.set_enabled(should_diagnose)
+            if hasattr(optimizer, "diagnostics_enabled"):
+                optimizer.diagnostics_enabled = bool(should_diagnose and args.opt == "muon")
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(args, device):
@@ -598,7 +741,70 @@ def main() -> None:
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            diagnostic_payload = {}
+            tensor_snapshot = None
+            if should_diagnose:
+                diagnostic_payload.update(collect_weight_geometry(
+                    model,
+                    include_spectrum=spectrum_diagnostics,
+                    spectrum_layers=snapshot_layers,
+                ))
+                diagnostic_payload.update(collect_gradient_geometry(
+                    model,
+                    include_spectrum=spectrum_diagnostics,
+                    spectrum_layers=snapshot_layers,
+                ))
+                diagnostic_payload.update(activation_recorder.get_metrics())
+                diagnostic_payload.update(collect_global_gradient_metrics(model))
+                diagnostic_payload.update({
+                    "diagnostics/global_step": float(step_number),
+                    "diagnostics/epoch": float(epoch),
+                    "diagnostics/teleport_event": float(teleport_is_scheduled),
+                    "diagnostics/accepted_teleport_event": float(accepted_teleport_event),
+                })
+                if csd_diagnostics_due:
+                    diagnostic_payload.update(collect_csd_diagnostics(
+                        model, optimizer, use_nesterov_score=bool(args.nesterov)
+                    ))
+                if tensor_snapshot_due:
+                    extra_tensors = {}
+                    if accepted_teleport_event and pre_teleport_weights is not None:
+                        extra_tensors.update({
+                            f"teleport/before/{name}": tensor
+                            for name, tensor in pre_teleport_weights.items()
+                        })
+                        post_weights = collect_weight_tensors(
+                            model, layer_indices=snapshot_layers, clone=True
+                        )
+                        extra_tensors.update({
+                            f"teleport/after/{name}": tensor
+                            for name, tensor in post_weights.items()
+                        })
+                        diagnostic_payload.update(compare_weight_snapshots(
+                            pre_teleport_weights, post_weights
+                        ))
+                    tensor_snapshot = build_tensor_snapshot(
+                        model,
+                        activation_recorder,
+                        snapshot_layers,
+                        extra_tensors=extra_tensors,
+                        include_weights=not (
+                            accepted_teleport_event and pre_teleport_weights is not None
+                        ),
+                    )
+
             optimizer.step()
+            if should_diagnose:
+                diagnostic_payload.update(optimizer_diagnostic_metrics(optimizer))
+                if diagnostic_payload:
+                    run.log(diagnostic_payload, step=step_number)
+                if tensor_snapshot is not None:
+                    log_tensor_visuals(run, tensor_snapshot, step=step_number)
+                    log_tensor_artifact(run, tensor_snapshot, save_dir, step_number, epoch)
+            activation_recorder.set_enabled(False)
+            if hasattr(optimizer, "diagnostics_enabled"):
+                optimizer.diagnostics_enabled = False
 
             token_count = int(targets.numel())
             loss_value = float(loss.detach().float().item())
@@ -741,6 +947,7 @@ def main() -> None:
         run.summary["timing/total_train_seconds"] = total_train_seconds
         run.summary["timing/total_validation_seconds"] = total_validation_seconds
         run.summary["timing/run_seconds"] = time.perf_counter() - run_started
+        activation_recorder.close()
 
 
 if __name__ == "__main__":

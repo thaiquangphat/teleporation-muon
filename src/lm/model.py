@@ -85,6 +85,10 @@ class GPT2SelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=True)
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
+        # Gated instrumentation: no activation tensors are retained unless the
+        # training loop explicitly enables diagnostics for this forward pass.
+        self.diagnostics_enabled = False
+        self.last_diagnostics = None
 
     def _split_heads(self, value: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_size = value.shape
@@ -129,6 +133,7 @@ class GPT2SelfAttention(nn.Module):
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
+        query_pre_pe, key_pre_pe = query, key
 
         if self.position_embedding == "rope":
             query = self._apply_rope(query, position_ids)
@@ -164,6 +169,36 @@ class GPT2SelfAttention(nn.Module):
             batch_size, seq_len, self.n_head * self.head_dim
         )
         output = self.c_proj(context)
+        if self.diagnostics_enabled:
+            # Reconstruct the pre-dropout attention distribution only for
+            # scheduled diagnostic passes. This does not participate in the
+            # SDPA context computation and therefore cannot change model output.
+            # Match the default scale used by the production SDPA call above.
+            # (The current forward path does not pass a custom SDPA scale.)
+            scale = self.head_dim ** -0.5
+            qk_logits = torch.matmul(query.float(), key.float().transpose(-1, -2)) * scale
+            allowed = torch.ones(
+                seq_len, seq_len, device=hidden_states.device, dtype=torch.bool
+            ).tril().view(1, 1, seq_len, seq_len)
+            if attention_mask is not None:
+                allowed = allowed & attention_mask.to(torch.bool).view(batch_size, 1, 1, seq_len)
+            qk_logits = qk_logits.masked_fill(~allowed, torch.finfo(qk_logits.dtype).min)
+            attention_probs = torch.softmax(qk_logits, dim=-1)
+            self.last_diagnostics = {
+                "Q_PRE_PE": query_pre_pe.detach(),
+                "K_PRE_PE": key_pre_pe.detach(),
+                "Q": query.detach(),
+                "K": key.detach(),
+                "V": value.detach(),
+                "QK_LOGITS": qk_logits.detach(),
+                # Probabilities are before attention dropout. The production
+                # context still comes from the unchanged SDPA call above.
+                "ATTENTION_PROBS": attention_probs.detach(),
+                "O_INPUT": context.detach(),
+                "O_OUTPUT": output.detach(),
+            }
+        else:
+            self.last_diagnostics = None
         return self.resid_dropout(output)
 
 
@@ -175,6 +210,8 @@ class GPT2MLP(nn.Module):
         self.c_proj = nn.Linear(inner_dim, config.n_embd, bias=True)
         self.dropout = nn.Dropout(config.resid_pdrop)
         self.activation_function = config.activation_function
+        self.diagnostics_enabled = False
+        self.last_diagnostics = None
 
     def _activation(self, x: torch.Tensor) -> torch.Tensor:
         name = self.activation_function
@@ -194,10 +231,19 @@ class GPT2MLP(nn.Module):
         raise ValueError(f"Unsupported GPT-2 activation function: {name}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.c_fc(hidden_states)
-        hidden_states = self._activation(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        return self.dropout(hidden_states)
+        fc_pre_activation = self.c_fc(hidden_states)
+        activation = self._activation(fc_pre_activation)
+        projected = self.c_proj(activation)
+        if self.diagnostics_enabled:
+            self.last_diagnostics = {
+                "INPUT": hidden_states.detach(),
+                "FC_PRE_ACTIVATION": fc_pre_activation.detach(),
+                "ACTIVATION": activation.detach(),
+                "OUTPUT_PROJECTION": projected.detach(),
+            }
+        else:
+            self.last_diagnostics = None
+        return self.dropout(projected)
 
 
 class GPT2Block(nn.Module):

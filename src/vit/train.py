@@ -12,6 +12,16 @@ from tqdm import tqdm
 from transformers import ViTConfig, ViTForImageClassification
 
 from datamodule import get_dataset
+from diagnostics import (
+    AttentionActivationRecorder,
+    build_tensor_snapshot,
+    collect_attention_gradient_geometry,
+    collect_csd_diagnostics,
+    collect_weight_geometry,
+    log_tensor_artifact,
+    log_tensor_visuals,
+    optimizer_diagnostic_metrics,
+)
 from model import ViTRoPEForImageClassification
 from muon import create_muon_optimizer
 from teleport import generate_tele_scheduler, try_teleportation
@@ -72,6 +82,20 @@ def parse_args():
     parser.add_argument("--tele-candidates", type=int, default=6)
     parser.add_argument("--tele-accept-tol", type=float, default=1e-6)
     parser.add_argument("--max-train-batches", type=int, default=0, help="If > 0, stop each epoch after this many train batches.")
+    parser.add_argument("--diagnostics-interval", type=int, default=100,
+                        help="Collect matrix/activation/optimizer diagnostics every N training steps; 0 disables periodic diagnostics.")
+    parser.add_argument("--diagnostics-spectrum-interval", type=int, default=500,
+                        help="Compute exact singular-spectrum, effective-rank, numerical-rank, and condition metrics every N steps.")
+    parser.add_argument("--diagnostics-csd-interval", type=int, default=500,
+                        help="Compute per-matrix CSD nuclear-norm coefficients every N steps; also computed at teleport events.")
+    parser.add_argument("--diagnostics-tensor-interval", type=int, default=500,
+                        help="Upload exact Q/K/V/O tensor artifacts every N steps (activation tensors use one representative batch sample); 0 disables periodic snapshots.")
+    parser.add_argument("--diagnostics-artifact-on-teleport", action=argparse.BooleanOptionalAction, default=True,
+                        help="Upload exact tensor artifacts after accepted teleportations (use --no-diagnostics-artifact-on-teleport to disable).")
+    parser.add_argument("--diagnostics-image-layers", type=int, default=3,
+                        help="Number of representative layers to render as W&B matrix images.")
+    parser.add_argument("--diagnostics-candidate-rollout", action="store_true",
+                        help="Run one virtual optimizer step per teleport candidate and log whether the CSD score predicts actual same-batch loss improvement (expensive).")
     return parser.parse_args()
 
 
@@ -263,6 +287,7 @@ def main():
         total_train_time_seconds = 0.0
         total_validation_time_seconds = 0.0
         total_checkpoint_time_seconds = 0.0
+        activation_recorder = AttentionActivationRecorder(model)
         telemetry_table = wandb.Table(
             columns=[
                 "epoch",
@@ -276,6 +301,16 @@ def main():
                 "selected_csd_l2_score",
                 "selected_candidate_index",
                 "num_candidates_evaluated",
+                "function_preservation_relative_error",
+                "function_preservation_max_abs_error",
+                "function_preservation_rms_error",
+                "candidate_score_improvement_pearson",
+                "candidate_score_improvement_spearman",
+                "candidate_score_top1_matches_best_improvement",
+                "best_improvement_candidate_index",
+                "momentum_state_transported",
+                "muon_momentum_reset",
+                "auxiliary_adam_state_reset",
             ]
         )
         candidate_table = wandb.Table(
@@ -289,7 +324,11 @@ def main():
                 "csd_l2_score",
                 "csd_l2_rank",
                 "post_step_loss_evaluated",
+                "pre_step_loss",
                 "post_step_loss",
+                "predicted_loss_decrease",
+                "function_preservation_relative_error",
+                "function_preservation_max_abs_error",
             ]
         )
         if device.type == "cuda":
@@ -305,13 +344,26 @@ def main():
                 if args.max_train_batches > 0 and i >= args.max_train_batches:
                     break
                 images, labels = images.to(device), labels.to(device)
-
-                if (
+                teleport_event = (
                     maybe_teleport(args)
                     and tele_scheduler is not None
                     and tele_scheduler[i]
                     and epoch in args.tele_epoch_array
-                ):
+                )
+                teleport_geometry_before = {}
+                teleport_logits_before = None
+
+                if teleport_event:
+                    # Snapshot pre-teleport geometry only at event boundaries.
+                    # The forward comparison is done in eval mode so dropout
+                    # cannot masquerade as a function-preservation error.
+                    if args.diagnostics_interval > 0 or args.diagnostics_artifact_on_teleport:
+                        teleport_geometry_before = collect_weight_geometry(model, include_spectrum=True)
+                        was_training = model.training
+                        model.eval()
+                        with torch.no_grad():
+                            teleport_logits_before = model(pixel_values=images).logits.detach().float()
+                        model.train(was_training)
                     method = args.tele_method
                     if method == "none" and args.n_teleport > 0:
                         method = "naive"
@@ -325,6 +377,37 @@ def main():
                         args=teleport_args,
                         step_index=global_step,
                     )
+                    event_geometry_metrics = {}
+                    if accepted and teleport_logits_before is not None:
+                        after_geometry = collect_weight_geometry(model, include_spectrum=True)
+                        event_geometry_metrics.update({
+                            f"teleport/geometry_before/{key}": value
+                            for key, value in teleport_geometry_before.items()
+                        })
+                        event_geometry_metrics.update({
+                            f"teleport/geometry_after/{key}": value
+                            for key, value in after_geometry.items()
+                        })
+                        for key, before_value in teleport_geometry_before.items():
+                            after_value = after_geometry.get(key)
+                            if after_value is not None:
+                                event_geometry_metrics[f"teleport/geometry_delta/{key}"] = after_value - before_value
+                        was_training = model.training
+                        model.eval()
+                        with torch.no_grad():
+                            teleport_logits_after = model(pixel_values=images).logits.detach().float()
+                        model.train(was_training)
+                        logit_difference = teleport_logits_after - teleport_logits_before
+                        info["live_function_preservation_relative_error"] = float(
+                            torch.linalg.vector_norm(logit_difference).item()
+                            / max(torch.linalg.vector_norm(teleport_logits_before).item(), 1e-12)
+                        )
+                        info["live_function_preservation_max_abs_error"] = float(
+                            logit_difference.abs().max().item()
+                        )
+                    elif teleport_logits_before is not None:
+                        info["live_function_preservation_relative_error"] = 0.0
+                        info["live_function_preservation_max_abs_error"] = 0.0
                     info["epoch"] = epoch
                     info["batch"] = i
                     info["accepted"] = accepted
@@ -342,6 +425,16 @@ def main():
                         info.get("selected_csd_l2_score", info.get("selected_alignment")),
                         info.get("selected_candidate_index"),
                         info.get("num_candidates_evaluated"),
+                        info.get("function_preservation_relative_error"),
+                        info.get("function_preservation_max_abs_error"),
+                        info.get("function_preservation_rms_error"),
+                        info.get("candidate_score_improvement_pearson"),
+                        info.get("candidate_score_improvement_spearman"),
+                        info.get("candidate_score_top1_matches_best_improvement"),
+                        info.get("best_improvement_candidate_index"),
+                        info.get("momentum_state_transported"),
+                        info.get("muon_momentum_reset"),
+                        info.get("auxiliary_adam_state_reset"),
                     )
                     for candidate in info.get("results", []):
                         candidate_table.add_data(
@@ -354,7 +447,11 @@ def main():
                             candidate.get("csd_l2_score", candidate.get("alignment")),
                             candidate.get("csd_l2_rank", candidate.get("alignment_rank")),
                             candidate.get("post_step_loss") is not None,
+                            candidate.get("pre_step_loss"),
                             candidate.get("post_step_loss"),
+                            candidate.get("predicted_loss_decrease"),
+                            candidate.get("function_preservation_relative_error"),
+                            candidate.get("function_preservation_max_abs_error"),
                         )
                     event_metrics = {
                         "teleport/attempted": attempted_teleports,
@@ -368,13 +465,119 @@ def main():
                         "teleport/selected_candidate_index": info.get("selected_candidate_index"),
                         "teleport/num_candidates_evaluated": info.get("num_candidates_evaluated"),
                         "teleport/accepted_event": int(accepted),
+                        "teleport/function_preservation_relative_error": info.get(
+                            "live_function_preservation_relative_error",
+                            info.get("function_preservation_relative_error"),
+                        ),
+                        "teleport/function_preservation_max_abs_error": info.get(
+                            "live_function_preservation_max_abs_error",
+                            info.get("function_preservation_max_abs_error"),
+                        ),
+                        "teleport/candidate_score_improvement_pearson": info.get(
+                            "candidate_score_improvement_pearson"
+                        ),
+                        "teleport/candidate_score_improvement_spearman": info.get(
+                            "candidate_score_improvement_spearman"
+                        ),
+                        "teleport/candidate_score_top1_matches_best_improvement": info.get(
+                            "candidate_score_top1_matches_best_improvement"
+                        ),
+                        "teleport/momentum_state_transported": float(
+                            bool(info.get("momentum_state_transported", False))
+                        ),
+                        "teleport/muon_momentum_reset": float(
+                            bool(info.get("muon_momentum_reset", False))
+                        ),
+                        "teleport/auxiliary_adam_state_reset": float(
+                            bool(info.get("auxiliary_adam_state_reset", False))
+                        ),
                     }
                     run.log({key: value for key, value in event_metrics.items() if value is not None})
+                    if event_geometry_metrics:
+                        event_geometry_metrics["diagnostics/global_step"] = global_step
+                        run.log(event_geometry_metrics)
 
+                periodic_diagnostics = (
+                    args.diagnostics_interval > 0 and (global_step + 1) % args.diagnostics_interval == 0
+                )
+                accepted_teleport_event = bool(teleport_event and accepted) if teleport_event else False
+                spectrum_diagnostics = (
+                    args.diagnostics_spectrum_interval > 0
+                    and (global_step + 1) % args.diagnostics_spectrum_interval == 0
+                ) or accepted_teleport_event
+                should_snapshot_tensors = (
+                    args.diagnostics_tensor_interval > 0
+                    and (global_step + 1) % args.diagnostics_tensor_interval == 0
+                ) or (teleport_event and accepted and args.diagnostics_artifact_on_teleport)
+                should_diagnose = periodic_diagnostics or teleport_event or should_snapshot_tensors
+
+                activation_recorder.set_enabled(should_diagnose)
                 outputs = model(pixel_values=images).logits
                 loss = criterion(outputs, labels)
                 loss.backward()
+
+                diagnostic_payload = {}
+                snapshot = None
+                weight_tensors_for_visuals = None
+                activation_tensors_for_visuals = None
+                if should_diagnose:
+                    diagnostic_payload.update(
+                        collect_weight_geometry(model, include_spectrum=spectrum_diagnostics)
+                    )
+                    diagnostic_payload.update(
+                        collect_attention_gradient_geometry(model, include_spectrum=spectrum_diagnostics)
+                    )
+                    diagnostic_payload.update(activation_recorder.get_metrics())
+                    diagnostic_payload.update({
+                        "diagnostics/global_step": global_step,
+                        "diagnostics/epoch": epoch,
+                        "diagnostics/teleport_event": float(teleport_event),
+                        "diagnostics/accepted_teleport_event": float(accepted_teleport_event),
+                    })
+                    should_log_csd = (
+                        args.opt == "muon"
+                        and (
+                            (args.diagnostics_csd_interval > 0
+                             and (global_step + 1) % args.diagnostics_csd_interval == 0)
+                            or teleport_event
+                        )
+                    )
+                    if should_log_csd:
+                        diagnostic_payload.update(collect_csd_diagnostics(
+                            model,
+                            optimizer,
+                            use_nesterov_score=(args.tele_method == "csd_l2_nesterov"),
+                        ))
+
+                if should_snapshot_tensors:
+                    snapshot = build_tensor_snapshot(model, activation_recorder)
+                    weight_tensors_for_visuals = {
+                        name: tensor for name, tensor in snapshot.items() if "/weights/" in name
+                    }
+                    activation_tensors_for_visuals = {
+                        name: tensor for name, tensor in snapshot.items() if "/activations/" in name
+                    }
+
+                if hasattr(optimizer, "diagnostics_enabled"):
+                    optimizer.diagnostics_enabled = bool(should_diagnose and args.opt == "muon")
                 optimizer.step()
+                if hasattr(optimizer, "diagnostics_enabled"):
+                    optimizer.diagnostics_enabled = False
+                if should_diagnose:
+                    diagnostic_payload.update(optimizer_diagnostic_metrics(optimizer))
+                    if diagnostic_payload:
+                        run.log(diagnostic_payload)
+                if should_snapshot_tensors and snapshot is not None:
+                    log_tensor_visuals(
+                        run,
+                        weight_tensors_for_visuals,
+                        activation_tensors_for_visuals,
+                        step=global_step,
+                        max_image_layers=args.diagnostics_image_layers,
+                    )
+                    log_tensor_artifact(run, snapshot, save_dir, step=global_step, epoch=epoch)
+                activation_recorder.clear()
+                activation_recorder.set_enabled(False)
                 optimizer.zero_grad()
                 running_loss += loss.item()
                 global_step += 1
@@ -500,6 +703,7 @@ def main():
             )
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
+        activation_recorder.close()
         run.log({"teleport/events": telemetry_table})
         run.log({"teleport/candidates": candidate_table})
         run.summary["best/validation_accuracy"] = best_acc

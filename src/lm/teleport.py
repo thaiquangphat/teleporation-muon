@@ -431,7 +431,7 @@ def create_lm_muon_optimizer(
     if not adam_parameters:
         raise ValueError("No GPT-2 embedding/bias/normalization parameters were assigned to AdamW")
 
-    return SingleDeviceMuonWithAuxAdam(
+    optimizer = SingleDeviceMuonWithAuxAdam(
         [
             {
                 "params": muon_parameters,
@@ -451,6 +451,10 @@ def create_lm_muon_optimizer(
             },
         ]
     )
+    # Keep readable names outside optimizer state_dicts; used only for W&B
+    # diagnostics and reconstructed automatically for cloned optimizers.
+    optimizer.parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
+    return optimizer
 
 
 def transport_teleportation_optimizer_state(

@@ -122,6 +122,11 @@ class ViTRoPESelfAttention(nn.Module):
         self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        # Disabled during ordinary training. The diagnostics recorder enables
+        # this only on selected steps so no activation tensors are retained
+        # during the rest of the run.
+        self.diagnostics_enabled = False
+        self.last_diagnostics = None
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
@@ -153,6 +158,29 @@ class ViTRoPESelfAttention(nn.Module):
             scaling=self.scaling,
             dropout=0.0 if not self.training else self.dropout_prob,
         )
+
+        if self.diagnostics_enabled:
+            # Q/K here are post-RoPE, so QK_LOGITS measures the interaction
+            # actually entering attention rather than the pre-positional Q/K.
+            qk_logits = torch.matmul(
+                query_layer.float(), key_layer.float().transpose(-1, -2)
+            ) * self.scaling
+            self.last_diagnostics = {
+                "q_post_pe": query_layer.detach(),
+                "k_post_pe": key_layer.detach(),
+                "v": value_layer.detach(),
+                "qk_logits": qk_logits.detach(),
+                "context": context_layer.detach(),
+            }
+            if torch.is_tensor(attention_probs):
+                self.last_diagnostics["attention_probs"] = attention_probs.detach()
+            else:
+                # SDPA/flash backends may not return attention weights. With
+                # this ViT configuration's zero attention dropout and no mask,
+                # softmax of the recorded logits recovers the probabilities.
+                self.last_diagnostics["attention_probs"] = torch.softmax(qk_logits, dim=-1).detach()
+        else:
+            self.last_diagnostics = None
 
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.reshape(new_context_layer_shape)

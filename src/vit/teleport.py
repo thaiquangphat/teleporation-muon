@@ -967,6 +967,34 @@ def _resolve_alignment_shortlist(args: Any, non_identity_count: int) -> int:
     return min(shortlist, non_identity_count)
 
 
+def _average_ranks(values: List[float]) -> List[float]:
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start + 1
+        while end < len(order) and values[order[end]] == values[order[start]]:
+            end += 1
+        average_rank = 0.5 * (start + 1 + end)
+        for position in range(start, end):
+            ranks[order[position]] = average_rank
+        start = end
+    return ranks
+
+
+def _pearson_correlation(left: List[float], right: List[float]) -> Optional[float]:
+    if len(left) < 2 or len(left) != len(right):
+        return None
+    x = torch.tensor(left, dtype=torch.float64)
+    y = torch.tensor(right, dtype=torch.float64)
+    x = x - x.mean()
+    y = y - y.mean()
+    denominator = torch.linalg.vector_norm(x) * torch.linalg.vector_norm(y)
+    if denominator.item() <= 1e-15:
+        return None
+    return float((torch.dot(x, y) / denominator).item())
+
+
 def _try_csd_l2_teleportation_impl(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -1019,6 +1047,7 @@ def _try_csd_l2_teleportation_impl(
         )
 
         results: List[Dict[str, Any]] = []
+        candidate_logits: Dict[int, torch.Tensor] = {}
         for index, candidate in enumerate(candidates):
             candidate_model, candidate_optimizer = clone_model_and_optimizer(model, optimizer)
 
@@ -1032,6 +1061,10 @@ def _try_csd_l2_teleportation_impl(
 
             candidate_optimizer.zero_grad(set_to_none=True)
             logits = candidate_model(pixel_values=batch[0]).logits
+            # Classification logits are small relative to model activations;
+            # retaining these CPU copies lets us quantify functional
+            # preservation without another model forward pass.
+            candidate_logits[index] = logits.detach().float().cpu()
             loss = criterion(logits, batch[1])
             loss.backward()
             metrics = metrics_fn(candidate_optimizer)
@@ -1039,6 +1072,19 @@ def _try_csd_l2_teleportation_impl(
                 raise ValueError(
                     f"Non-finite {method_name} score for candidate {index}: {metrics['score']}."
                 )
+
+            pre_step_loss = float(loss.detach().item())
+            post_step_loss = None
+            if bool(getattr(args, "diagnostics_candidate_rollout", False)):
+                # Diagnostic-only virtual rollout on this candidate clone.
+                # The candidate score is stored before this step, and the
+                # mutated clone is discarded; live model/optimizer state is
+                # untouched. This is intentionally opt-in due to extra cost.
+                candidate_optimizer.step()
+                with torch.no_grad():
+                    post_step_loss = float(
+                        criterion(candidate_model(pixel_values=batch[0]).logits, batch[1]).item()
+                    )
 
             results.append(
                 {
@@ -1070,8 +1116,12 @@ def _try_csd_l2_teleportation_impl(
                     ),
                     "alignment_evaluated": True,
                     "alignment_rank": None,
-                    "virtual_loss_evaluated": False,
-                    "post_step_loss": None,
+                    "virtual_loss_evaluated": post_step_loss is not None,
+                    "pre_step_loss": pre_step_loss,
+                    "post_step_loss": post_step_loss,
+                    "predicted_loss_decrease": (
+                        pre_step_loss - post_step_loss if post_step_loss is not None else None
+                    ),
                     "searched": False,
                 }
             )
@@ -1088,6 +1138,37 @@ def _try_csd_l2_teleportation_impl(
         selected = ranked[0]
         selected_index = int(selected["candidate_index"])
         selected_candidate = candidates[selected_index]
+        identity_logits = candidate_logits[0]
+        selected_logits = candidate_logits[selected_index]
+        output_difference = selected_logits - identity_logits
+        output_difference_norm = float(torch.linalg.vector_norm(output_difference).item())
+        identity_output_norm = float(torch.linalg.vector_norm(identity_logits).item())
+        selected_function_relative_error = output_difference_norm / max(identity_output_norm, 1e-12)
+        selected_function_max_abs_error = float(output_difference.abs().max().item())
+        selected_function_rms_error = float(output_difference.square().mean().sqrt().item())
+        for result in results:
+            candidate_difference = candidate_logits[int(result["candidate_index"])] - identity_logits
+            candidate_difference_norm = float(torch.linalg.vector_norm(candidate_difference).item())
+            result["function_preservation_relative_error"] = (
+                candidate_difference_norm / max(identity_output_norm, 1e-12)
+            )
+            result["function_preservation_max_abs_error"] = float(candidate_difference.abs().max().item())
+
+        rollout_results = [item for item in results if item.get("predicted_loss_decrease") is not None]
+        rollout_scores = [float(item["csd_l2_score"]) for item in rollout_results]
+        rollout_gains = [float(item["predicted_loss_decrease"]) for item in rollout_results]
+        score_gain_pearson = _pearson_correlation(rollout_scores, rollout_gains)
+        score_gain_spearman = _pearson_correlation(
+            _average_ranks(rollout_scores), _average_ranks(rollout_gains)
+        ) if len(rollout_results) >= 2 else None
+        best_gain_candidate_index = (
+            int(max(rollout_results, key=lambda item: float(item["predicted_loss_decrease"]))["candidate_index"])
+            if rollout_results else None
+        )
+        score_top1_matches_best_gain = (
+            float(selected_index == best_gain_candidate_index)
+            if best_gain_candidate_index is not None else None
+        )
         identity_result = next(item for item in results if item["identity"])
         non_identity_results = [item for item in results if not item["identity"]]
         best_non_identity = (
@@ -1122,6 +1203,13 @@ def _try_csd_l2_teleportation_impl(
             "reason": reason,
             "step": step_index,
             "search_time_seconds": search_time,
+            "function_preservation_relative_error": selected_function_relative_error,
+            "function_preservation_max_abs_error": selected_function_max_abs_error,
+            "function_preservation_rms_error": selected_function_rms_error,
+            "candidate_score_improvement_pearson": score_gain_pearson,
+            "candidate_score_improvement_spearman": score_gain_spearman,
+            "candidate_score_top1_matches_best_improvement": score_top1_matches_best_gain,
+            "best_improvement_candidate_index": best_gain_candidate_index,
             "identity_csd_l2_score": identity_score,
             "selected_csd_l2_score": selected_score,
             "csd_l2_gain": score_gain,
