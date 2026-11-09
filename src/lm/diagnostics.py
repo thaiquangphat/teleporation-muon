@@ -390,20 +390,124 @@ def build_tensor_snapshot(
     return snapshot
 
 
+def _tensor_image_view(tensor: torch.Tensor, name: str) -> Optional[torch.Tensor]:
+    """Convert a captured tensor into a meaningful 2D view for heatmap logging.
+
+    Weight/composition tensors are already 2D. Activations are typically
+    [batch, heads, sequence, head_dim] or [batch, sequence, hidden_dim]. We
+    display the first sample and stack heads vertically, preserving all heads
+    instead of silently selecting only head zero.
+    """
+    value = tensor.detach().float().cpu()
+    if value.ndim == 2:
+        return value
+    if value.ndim == 4:
+        # [B, H, S, D] -> [H*S, D]. This also handles [B, H, S, S]
+        # attention-logit/probability tensors.
+        value = value[0]
+        heads, rows, columns = value.shape
+        return value.reshape(heads * rows, columns)
+    if value.ndim == 3:
+        # [B, S, D] -> [S, D].
+        return value[0]
+    return None
+
+
+def _wandb_tensor_heatmap(wandb, tensor: torch.Tensor, name: str):
+    """Render signed tensors as zero-centred diverging heatmaps and
+    probabilities as sequential heatmaps. The source tensor is never changed.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize, TwoSlopeNorm
+
+    view = _tensor_image_view(tensor, name)
+    if view is None or view.numel() == 0:
+        return None
+
+    # Sanitize only the visualization copy; exact tensors remain in the .pt
+    # artifact. This prevents NaN/Inf values from breaking imshow/norm.
+    array = view.numpy()
+    finite = torch.isfinite(view)
+    if not bool(finite.any()):
+        return None
+    finite_values = view[finite]
+    is_probability = any(
+        token in name.lower()
+        for token in ("attention_probs", "attention_probabilities")
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    try:
+        if is_probability:
+            # Attention probabilities are nonnegative. A robust upper bound
+            # reveals structure without letting a few peaks wash out the map.
+            upper = float(torch.quantile(finite_values, 0.995).item())
+            upper = max(upper, 1e-8)
+            safe_array = array.copy()
+            safe_array[~finite.numpy()] = 0.0
+            im = ax.imshow(
+                safe_array,
+                cmap="viridis",
+                norm=Normalize(vmin=0.0, vmax=upper, clip=True),
+                aspect="auto",
+                interpolation="nearest",
+            )
+        else:
+            # Weights, activations and logits are signed: centre the colour
+            # scale at zero so positive and negative values are comparable.
+            scale = float(torch.quantile(finite_values.abs(), 0.995).item())
+            scale = max(scale, 1e-8)
+            safe_array = array.copy()
+            safe_array[~finite.numpy()] = 0.0
+            im = ax.imshow(
+                safe_array,
+                cmap="RdBu_r",
+                norm=TwoSlopeNorm(vmin=-scale, vcenter=0.0, vmax=scale),
+                aspect="auto",
+                interpolation="nearest",
+            )
+
+        ax.set_title(name, fontsize=9)
+        ax.set_xlabel("Feature / key position")
+        ax.set_ylabel("Feature / query position (heads stacked for activations)")
+        fig.colorbar(im, ax=ax, fraction=0.035, pad=0.03)
+        return wandb.Image(fig)
+    finally:
+        plt.close(fig)
+
+
 def log_tensor_visuals(run: Any, snapshot: Mapping[str, torch.Tensor], step: int) -> None:
-    """Log bounded histograms for exact tensors also stored in an artifact."""
+    """Log colour heatmaps and value histograms for saved weights/activations.
+
+    Matrix tensors are rendered as scientific heatmaps (not W&B's default
+    grayscale interpretation of a raw 2D NumPy array). Rank-3/4 activations
+    are reduced to a 2D view using the first batch item and all heads stacked
+    vertically. Histograms use finite raw values and deterministic subsampling.
+    """
     import wandb
 
     payload: Dict[str, Any] = {}
     max_points = 50_000
     for name, tensor in snapshot.items():
-        if "/weights/" not in name:
+        if "/weights/" not in name and "/activations/" not in name:
             continue
-        value = tensor.detach().float().reshape(-1).cpu()
+
+        value = tensor.detach().float().reshape(-1)
         if value.numel() == 0:
             continue
+        value = value[torch.isfinite(value)]
+        if value.numel() == 0:
+            continue
+        value = value.cpu()
         stride = max(1, math.ceil(value.numel() / max_points))
-        payload[f"tensor_histograms/{name}"] = wandb.Histogram(value[::stride].numpy())
+        payload[f"tensor_histograms/{name}"] = wandb.Histogram(
+            value[::stride].numpy(), num_bins=64
+        )
+
+        heatmap = _wandb_tensor_heatmap(wandb, tensor, name)
+        if heatmap is not None:
+            payload[f"tensor_images/{name}"] = heatmap
+
     if payload:
         payload["diagnostics/tensor_snapshot_step"] = int(step)
         run.log(payload, step=step)

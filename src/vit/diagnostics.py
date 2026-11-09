@@ -14,6 +14,58 @@ import torch
 from torch import nn
 
 
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm, Normalize
+import wandb
+
+def tensor_to_heatmap(value, name):
+
+    array = value.detach().float().cpu().numpy()
+
+    if array.ndim != 2:
+        raise ValueError(f"Expected 2D tensor, got {array.shape}")
+
+    array = np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+
+    name_lower = name.lower()
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    if "attention_probs" in name_lower or "attention_probabilities" in name_lower:
+        upper = max(float(np.quantile(array, 0.995)), 1e-8)
+        im = ax.imshow(
+            array,
+            cmap="viridis",
+            norm=Normalize(vmin=0.0, vmax=upper, clip=True),
+            aspect="auto",
+            interpolation="nearest",
+        )
+    else:
+        scale = max(float(np.quantile(np.abs(array), 0.99)), 1e-8)
+        im = ax.imshow(
+            array,
+            cmap="RdBu_r",
+            norm=TwoSlopeNorm(
+                vmin=-scale,
+                vcenter=0.0,
+                vmax=scale,
+            ),
+            aspect="auto",
+            interpolation="nearest",
+        )
+
+    ax.set_title(name, fontsize=10)
+    ax.set_xlabel("Dimension")
+    ax.set_ylabel("Dimension")
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+
+    image = wandb.Image(fig)
+    plt.close(fig)
+
+    return image
+
 def _matrix_view(tensor: torch.Tensor) -> Optional[torch.Tensor]:
     value = tensor.detach().float()
     if value.ndim == 2:
@@ -591,7 +643,7 @@ def log_tensor_visuals(
                     continue
                 value = tensor.detach().float().cpu()
                 if value.ndim == 2:
-                    payload[f"tensor_images/{name}"] = wandb.Image(value.numpy())
+                    payload[f"tensor_images/{name}"] = tensor_to_heatmap(value, name)
             for name, tensor in activation_tensors.items():
                 if not name.startswith(prefix + "/activations/"):
                     continue
@@ -601,7 +653,7 @@ def log_tensor_visuals(
                 elif value.ndim == 3:
                     value = value[0]
                 if value.ndim == 2:
-                    payload[f"tensor_images/{name}"] = wandb.Image(value.numpy())
+                    payload[f"tensor_images/{name}"] = tensor_to_heatmap(value, name)
     if payload:
         payload["diagnostics/tensor_snapshot_step"] = int(step)
         run.log(payload)
