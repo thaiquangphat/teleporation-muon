@@ -1,6 +1,5 @@
 import argparse
 import os
-import time
 
 import torch
 import wandb
@@ -12,16 +11,6 @@ from tqdm import tqdm
 from transformers import ViTConfig, ViTForImageClassification
 
 from datamodule import get_dataset
-from diagnostics import (
-    AttentionActivationRecorder,
-    build_tensor_snapshot,
-    collect_attention_gradient_geometry,
-    collect_csd_diagnostics,
-    collect_weight_geometry,
-    log_tensor_artifact,
-    log_tensor_visuals,
-    optimizer_diagnostic_metrics,
-)
 from model import ViTRoPEForImageClassification
 from muon import create_muon_optimizer
 from teleport import generate_tele_scheduler, try_teleportation
@@ -76,26 +65,22 @@ def parse_args():
         "--tele-method",
         type=str,
         default="none",
-        choices=["none", "naive", "csd_l2", "csd_l2_nesterov", "muon_alignment"],
-        help="none keeps a plain optimizer baseline; naive is the original MNISTCIFAR teleport; csd_l2 scores EMA momentum; csd_l2_nesterov scores Muon's Nesterov-corrected pre-Newton--Schulz direction; muon_alignment is a backward-compatible alias for csd_l2.",
+        choices=[
+            "none", "naive", "csd_l2", "csd_l2_nesterov",
+            "csd_l2_nesterov_frobenius", "csd_l2_nesterov_post_orth", "csd_l2_nesterov_post_orth_frobenius",
+            "muon_alignment",
+        ],
+        help=(
+            "none keeps a plain optimizer baseline; naive is the original MNISTCIFAR teleport; "
+            "csd_l2 scores EMA momentum; csd_l2_nesterov scores pre-orthogonalization nuclear "
+            "norms; csd_l2_nesterov_frobenius scores pre-orthogonalization Frobenius norms; "
+            "csd_l2_nesterov_post_orth scores after Muon's Newton--Schulz orthogonalization; "
+            "muon_alignment aliases csd_l2."
+        ),
     )
     parser.add_argument("--tele-candidates", type=int, default=6)
     parser.add_argument("--tele-accept-tol", type=float, default=1e-6)
     parser.add_argument("--max-train-batches", type=int, default=0, help="If > 0, stop each epoch after this many train batches.")
-    parser.add_argument("--diagnostics-interval", type=int, default=100,
-                        help="Collect matrix/activation/optimizer diagnostics every N training steps; 0 disables periodic diagnostics.")
-    parser.add_argument("--diagnostics-spectrum-interval", type=int, default=500,
-                        help="Compute exact singular-spectrum, effective-rank, numerical-rank, and condition metrics every N steps.")
-    parser.add_argument("--diagnostics-csd-interval", type=int, default=500,
-                        help="Compute per-matrix CSD nuclear-norm coefficients every N steps; also computed at teleport events.")
-    parser.add_argument("--diagnostics-tensor-interval", type=int, default=500,
-                        help="Upload exact Q/K/V/O tensor artifacts every N steps (activation tensors use one representative batch sample); 0 disables periodic snapshots.")
-    parser.add_argument("--diagnostics-artifact-on-teleport", action=argparse.BooleanOptionalAction, default=True,
-                        help="Upload exact tensor artifacts after accepted teleportations (use --no-diagnostics-artifact-on-teleport to disable).")
-    parser.add_argument("--diagnostics-image-layers", type=int, default=3,
-                        help="Number of representative layers to render as W&B matrix images.")
-    parser.add_argument("--diagnostics-candidate-rollout", action="store_true",
-                        help="Run one virtual optimizer step per teleport candidate and log whether the CSD score predicts actual same-batch loss improvement (expensive).")
     return parser.parse_args()
 
 
@@ -153,10 +138,6 @@ def maybe_teleport(args):
     return args.tele_method != "none" or args.n_teleport > 0
 
 
-def synchronize_device(device):
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
 
 def load_wandb_settings(args):
     config_path = os.environ.get("WANDB_CONFIG_PATH", "./wandb.yaml")
@@ -186,13 +167,9 @@ def load_wandb_settings(args):
 def main():
     args = parse_args()
 
-    # Diagnostic A/B test: disable cuDNN TF32 only.
-    # Keep the attention implementation and all training/teleportation settings unchanged.
-    # torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
 
-    run_started = time.perf_counter()
     if args.tele_method == "naive" and args.n_teleport <= 0:
         args.n_teleport = max(args.tele_candidates, 2)
 
@@ -203,11 +180,7 @@ def main():
     save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(save_dir, exist_ok=True)
 
-    setup_started = time.perf_counter()
-    model_started = time.perf_counter()
     model = build_model(args, device)
-
-    # Record the effective numerical settings for cross-GPU comparisons.
     print("\n========== NUMERICAL CONFIGURATION ==========")
     print("Device:", device)
     print("GPU:", torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU")
@@ -220,19 +193,17 @@ def main():
     print("Float32 matmul precision:", torch.get_float32_matmul_precision())
     print("==============================================\n")
 
-    model_setup_time_seconds = time.perf_counter() - model_started
-    data_started = time.perf_counter()
     train_loader, val_loader = get_dataset(args)
-    data_loading_time_seconds = time.perf_counter() - data_started
     optimizer = build_optimizer(model, args)
-    model_setup_time_seconds = time.perf_counter() - model_started
 
     if args.lr_scheduler == "cosine":
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     elif args.lr_scheduler == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
     elif args.lr_scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=2
+        )
     else:
         scheduler = None
 
@@ -249,8 +220,8 @@ def main():
     global_step = 0
     best_acc = 0.0
     best_epoch = 0
-    gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else None
     project, entity, mode = load_wandb_settings(args)
+
     with wandb.init(
         project=project,
         entity=entity,
@@ -260,116 +231,33 @@ def main():
         mode=mode,
         job_type="train",
     ) as run:
-        run_started = time.perf_counter()
-        run.config.update(
-            {
-                "environment_device": str(device),
-                "environment_gpu_name": gpu_name or "cpu",
-                "environment_torch_version": torch.__version__,
-                "environment_cuda_version": torch.version.cuda or "none",
-                "dataset_train_samples": len(train_loader.dataset),
-                "dataset_validation_samples": len(val_loader.dataset),
-                "dataset_train_batches_per_epoch": len(train_loader),
-                "dataset_validation_batches_per_epoch": len(val_loader),
-                "model_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
-            },
-            allow_val_change=True,
-        )
-        run.log(
-            {
-                "timing/data_loading_seconds": data_loading_time_seconds,
-                "timing/model_setup_seconds": model_setup_time_seconds,
-                "timing/initialization_seconds": time.perf_counter() - setup_started,
-            },
-        )
-        attempted_teleports = 0
-        accepted_teleports = 0
-        total_train_time_seconds = 0.0
-        total_validation_time_seconds = 0.0
-        total_checkpoint_time_seconds = 0.0
-        activation_recorder = AttentionActivationRecorder(model)
-        telemetry_table = wandb.Table(
-            columns=[
-                "epoch",
-                "batch",
-                "global_step",
-                "method",
-                "accepted",
-                "reason",
-                "search_time_seconds",
-                "csd_l2_gain",
-                "selected_csd_l2_score",
-                "selected_candidate_index",
-                "num_candidates_evaluated",
-                "function_preservation_relative_error",
-                "function_preservation_max_abs_error",
-                "function_preservation_rms_error",
-                "candidate_score_improvement_pearson",
-                "candidate_score_improvement_spearman",
-                "candidate_score_top1_matches_best_improvement",
-                "best_improvement_candidate_index",
-                "momentum_state_transported",
-                "muon_momentum_reset",
-                "auxiliary_adam_state_reset",
-            ]
-        )
-        candidate_table = wandb.Table(
-            columns=[
-                "epoch",
-                "batch",
-                "global_step",
-                "method",
-                "candidate_index",
-                "is_identity",
-                "csd_l2_score",
-                "csd_l2_rank",
-                "post_step_loss_evaluated",
-                "pre_step_loss",
-                "post_step_loss",
-                "predicted_loss_decrease",
-                "function_preservation_relative_error",
-                "function_preservation_max_abs_error",
-            ]
-        )
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
         for epoch in range(1, args.epochs + 1):
-            synchronize_device(device)
-            epoch_started = time.perf_counter()
             model.train()
             running_loss = 0.0
             processed_batches = 0
-            processed_samples = 0
-            for i, (images, labels) in enumerate(tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")):
-                if args.max_train_batches > 0 and i >= args.max_train_batches:
+
+            for batch_index, (images, labels) in enumerate(
+                tqdm(train_loader, desc=f"[Epoch {epoch}/{args.epochs}] Training")
+            ):
+                if args.max_train_batches > 0 and batch_index >= args.max_train_batches:
                     break
-                images, labels = images.to(device), labels.to(device)
+
+                images = images.to(device)
+                labels = labels.to(device)
+
                 teleport_event = (
                     maybe_teleport(args)
                     and tele_scheduler is not None
-                    and tele_scheduler[i]
+                    and tele_scheduler[batch_index]
                     and epoch in args.tele_epoch_array
                 )
-                teleport_geometry_before = {}
-                teleport_logits_before = None
-
                 if teleport_event:
-                    # Snapshot pre-teleport geometry only at event boundaries.
-                    # The forward comparison is done in eval mode so dropout
-                    # cannot masquerade as a function-preservation error.
-                    if args.diagnostics_interval > 0 or args.diagnostics_artifact_on_teleport:
-                        teleport_geometry_before = collect_weight_geometry(model, include_spectrum=True)
-                        was_training = model.training
-                        model.eval()
-                        with torch.no_grad():
-                            teleport_logits_before = model(pixel_values=images).logits.detach().float()
-                        model.train(was_training)
                     method = args.tele_method
                     if method == "none" and args.n_teleport > 0:
                         method = "naive"
                     teleport_args = argparse.Namespace(**vars(args))
                     teleport_args.tele_method = method
-                    accepted, info = try_teleportation(
+                    try_teleportation(
                         model=model,
                         optimizer=optimizer,
                         batch=(images, labels),
@@ -377,344 +265,79 @@ def main():
                         args=teleport_args,
                         step_index=global_step,
                     )
-                    event_geometry_metrics = {}
-                    if accepted and teleport_logits_before is not None:
-                        after_geometry = collect_weight_geometry(model, include_spectrum=True)
-                        event_geometry_metrics.update({
-                            f"teleport/geometry_before/{key}": value
-                            for key, value in teleport_geometry_before.items()
-                        })
-                        event_geometry_metrics.update({
-                            f"teleport/geometry_after/{key}": value
-                            for key, value in after_geometry.items()
-                        })
-                        for key, before_value in teleport_geometry_before.items():
-                            after_value = after_geometry.get(key)
-                            if after_value is not None:
-                                event_geometry_metrics[f"teleport/geometry_delta/{key}"] = after_value - before_value
-                        was_training = model.training
-                        model.eval()
-                        with torch.no_grad():
-                            teleport_logits_after = model(pixel_values=images).logits.detach().float()
-                        model.train(was_training)
-                        logit_difference = teleport_logits_after - teleport_logits_before
-                        info["live_function_preservation_relative_error"] = float(
-                            torch.linalg.vector_norm(logit_difference).item()
-                            / max(torch.linalg.vector_norm(teleport_logits_before).item(), 1e-12)
-                        )
-                        info["live_function_preservation_max_abs_error"] = float(
-                            logit_difference.abs().max().item()
-                        )
-                    elif teleport_logits_before is not None:
-                        info["live_function_preservation_relative_error"] = 0.0
-                        info["live_function_preservation_max_abs_error"] = 0.0
-                    info["epoch"] = epoch
-                    info["batch"] = i
-                    info["accepted"] = accepted
-                    attempted_teleports += 1
-                    accepted_teleports += int(accepted)
-                    telemetry_table.add_data(
-                        epoch,
-                        i,
-                        global_step,
-                        info.get("method", method),
-                        accepted,
-                        info.get("reason", ""),
-                        info.get("search_time_seconds", 0.0),
-                        info.get("csd_l2_gain", info.get("alignment_gain")),
-                        info.get("selected_csd_l2_score", info.get("selected_alignment")),
-                        info.get("selected_candidate_index"),
-                        info.get("num_candidates_evaluated"),
-                        info.get("function_preservation_relative_error"),
-                        info.get("function_preservation_max_abs_error"),
-                        info.get("function_preservation_rms_error"),
-                        info.get("candidate_score_improvement_pearson"),
-                        info.get("candidate_score_improvement_spearman"),
-                        info.get("candidate_score_top1_matches_best_improvement"),
-                        info.get("best_improvement_candidate_index"),
-                        info.get("momentum_state_transported"),
-                        info.get("muon_momentum_reset"),
-                        info.get("auxiliary_adam_state_reset"),
-                    )
-                    for candidate in info.get("results", []):
-                        candidate_table.add_data(
-                            epoch,
-                            i,
-                            global_step,
-                            info.get("method", method),
-                            candidate.get("candidate_index"),
-                            candidate.get("identity"),
-                            candidate.get("csd_l2_score", candidate.get("alignment")),
-                            candidate.get("csd_l2_rank", candidate.get("alignment_rank")),
-                            candidate.get("post_step_loss") is not None,
-                            candidate.get("pre_step_loss"),
-                            candidate.get("post_step_loss"),
-                            candidate.get("predicted_loss_decrease"),
-                            candidate.get("function_preservation_relative_error"),
-                            candidate.get("function_preservation_max_abs_error"),
-                        )
-                    event_metrics = {
-                        "teleport/attempted": attempted_teleports,
-                        "teleport/accepted": accepted_teleports,
-                        "teleport/acceptance_rate": accepted_teleports / attempted_teleports,
-                        "teleport/search_time_seconds": info.get("search_time_seconds", 0.0),
-                        "teleport/csd_l2_gain": info.get("csd_l2_gain", info.get("alignment_gain")),
-                        "teleport/selected_csd_l2_score": info.get(
-                            "selected_csd_l2_score", info.get("selected_alignment")
-                        ),
-                        "teleport/selected_candidate_index": info.get("selected_candidate_index"),
-                        "teleport/num_candidates_evaluated": info.get("num_candidates_evaluated"),
-                        "teleport/accepted_event": int(accepted),
-                        "teleport/function_preservation_relative_error": info.get(
-                            "live_function_preservation_relative_error",
-                            info.get("function_preservation_relative_error"),
-                        ),
-                        "teleport/function_preservation_max_abs_error": info.get(
-                            "live_function_preservation_max_abs_error",
-                            info.get("function_preservation_max_abs_error"),
-                        ),
-                        "teleport/candidate_score_improvement_pearson": info.get(
-                            "candidate_score_improvement_pearson"
-                        ),
-                        "teleport/candidate_score_improvement_spearman": info.get(
-                            "candidate_score_improvement_spearman"
-                        ),
-                        "teleport/candidate_score_top1_matches_best_improvement": info.get(
-                            "candidate_score_top1_matches_best_improvement"
-                        ),
-                        "teleport/momentum_state_transported": float(
-                            bool(info.get("momentum_state_transported", False))
-                        ),
-                        "teleport/muon_momentum_reset": float(
-                            bool(info.get("muon_momentum_reset", False))
-                        ),
-                        "teleport/auxiliary_adam_state_reset": float(
-                            bool(info.get("auxiliary_adam_state_reset", False))
-                        ),
-                    }
-                    run.log({key: value for key, value in event_metrics.items() if value is not None})
-                    if event_geometry_metrics:
-                        event_geometry_metrics["diagnostics/global_step"] = global_step
-                        run.log(event_geometry_metrics)
 
-                periodic_diagnostics = (
-                    args.diagnostics_interval > 0 and (global_step + 1) % args.diagnostics_interval == 0
-                )
-                accepted_teleport_event = bool(teleport_event and accepted) if teleport_event else False
-                spectrum_diagnostics = (
-                    args.diagnostics_spectrum_interval > 0
-                    and (global_step + 1) % args.diagnostics_spectrum_interval == 0
-                ) or accepted_teleport_event
-                should_snapshot_tensors = (
-                    args.diagnostics_tensor_interval > 0
-                    and (global_step + 1) % args.diagnostics_tensor_interval == 0
-                ) or (teleport_event and accepted and args.diagnostics_artifact_on_teleport)
-                should_diagnose = periodic_diagnostics or teleport_event or should_snapshot_tensors
-
-                activation_recorder.set_enabled(should_diagnose)
                 outputs = model(pixel_values=images).logits
                 loss = criterion(outputs, labels)
                 loss.backward()
-
-                diagnostic_payload = {}
-                snapshot = None
-                weight_tensors_for_visuals = None
-                activation_tensors_for_visuals = None
-                if should_diagnose:
-                    diagnostic_payload.update(
-                        collect_weight_geometry(model, include_spectrum=spectrum_diagnostics)
-                    )
-                    diagnostic_payload.update(
-                        collect_attention_gradient_geometry(model, include_spectrum=spectrum_diagnostics)
-                    )
-                    diagnostic_payload.update(activation_recorder.get_metrics())
-                    diagnostic_payload.update({
-                        "diagnostics/global_step": global_step,
-                        "diagnostics/epoch": epoch,
-                        "diagnostics/teleport_event": float(teleport_event),
-                        "diagnostics/accepted_teleport_event": float(accepted_teleport_event),
-                    })
-                    should_log_csd = (
-                        args.opt == "muon"
-                        and (
-                            (args.diagnostics_csd_interval > 0
-                             and (global_step + 1) % args.diagnostics_csd_interval == 0)
-                            or teleport_event
-                        )
-                    )
-                    if should_log_csd:
-                        diagnostic_payload.update(collect_csd_diagnostics(
-                            model,
-                            optimizer,
-                            use_nesterov_score=(args.tele_method == "csd_l2_nesterov"),
-                        ))
-
-                if should_snapshot_tensors:
-                    snapshot = build_tensor_snapshot(model, activation_recorder)
-                    weight_tensors_for_visuals = {
-                        name: tensor for name, tensor in snapshot.items() if "/weights/" in name
-                    }
-                    activation_tensors_for_visuals = {
-                        name: tensor for name, tensor in snapshot.items() if "/activations/" in name
-                    }
-
-                if hasattr(optimizer, "diagnostics_enabled"):
-                    optimizer.diagnostics_enabled = bool(should_diagnose and args.opt == "muon")
                 optimizer.step()
-                if hasattr(optimizer, "diagnostics_enabled"):
-                    optimizer.diagnostics_enabled = False
-                if should_diagnose:
-                    diagnostic_payload.update(optimizer_diagnostic_metrics(optimizer))
-                    if diagnostic_payload:
-                        run.log(diagnostic_payload)
-                if should_snapshot_tensors and snapshot is not None:
-                    log_tensor_visuals(
-                        run,
-                        weight_tensors_for_visuals,
-                        activation_tensors_for_visuals,
-                        step=global_step,
-                        max_image_layers=args.diagnostics_image_layers,
-                    )
-                    log_tensor_artifact(run, snapshot, save_dir, step=global_step, epoch=epoch)
-                activation_recorder.clear()
-                activation_recorder.set_enabled(False)
-                optimizer.zero_grad()
-                running_loss += loss.item()
-                global_step += 1
-                processed_batches += 1
-                processed_samples += labels.size(0)
-                run.log(
-                    {
-                        "train/batch_loss": loss.item(),
-                        "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        "train/muon_learning_rate": optimizer.param_groups[0]["lr"],
-                        **(
-                            {"train/adam_learning_rate": optimizer.param_groups[1]["lr"]}
-                            if args.opt == "muon" else {}
-                        ),
-                        "train/batch_size": labels.size(0),
-                    }
-                )
+                optimizer.zero_grad(set_to_none=True)
 
-            synchronize_device(device)
-            train_time_seconds = time.perf_counter() - epoch_started
-            total_train_time_seconds += train_time_seconds
-            avg_loss = running_loss / max(processed_batches, 1)
-            current_lr = optimizer.param_groups[0]["lr"]
-            current_adam_lr = (
-                optimizer.param_groups[1]["lr"] if args.opt == "muon" else None
+                running_loss += float(loss.detach().item())
+                processed_batches += 1
+                global_step += 1
+
+            avg_train_loss = running_loss / max(processed_batches, 1)
+            # These are the rates that were used during this epoch (before scheduler.step).
+            learning_rate = float(optimizer.param_groups[0]["lr"])
+            adam_learning_rate = (
+                float(optimizer.param_groups[1]["lr"])
+                if args.opt == "muon" and len(optimizer.param_groups) > 1
+                else None
             )
 
-            synchronize_device(device)
-            validation_started = time.perf_counter()
             model.eval()
-            correct, total = 0, 0
-            val_loss = 0.0
+            correct = 0
+            total = 0
+            val_loss_sum = 0.0
             with torch.no_grad():
                 for images, labels in val_loader:
-                    images, labels = images.to(device), labels.to(device)
-                    outputs = model(pixel_values=images).logits
-                    loss = criterion(outputs, labels)
-                    val_loss += loss.item()
-                    preds = outputs.argmax(dim=1)
-                    correct += (preds == labels).sum().item()
-                    total += labels.size(0)
-            synchronize_device(device)
-            validation_time_seconds = time.perf_counter() - validation_started
-            total_validation_time_seconds += validation_time_seconds
-            avg_val_acc = correct / total
-            avg_val_loss = val_loss / len(val_loader)
+                    images = images.to(device)
+                    labels = labels.to(device)
+                    logits = model(pixel_values=images).logits
+                    loss = criterion(logits, labels)
+                    val_loss_sum += float(loss.item())
+                    predictions = logits.argmax(dim=1)
+                    correct += int((predictions == labels).sum().item())
+                    total += int(labels.size(0))
 
-            checkpoint_started = time.perf_counter()
-            last_ckpt_path = os.path.join(save_dir, "last.pt")
+            avg_val_accuracy = correct / max(total, 1)
+            avg_val_loss = val_loss_sum / max(len(val_loader), 1)
+
             checkpoint = {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "epoch": epoch,
-                "loss": avg_loss,
-                "val_acc": avg_val_acc,
-                "lr": current_lr,
+                "loss": avg_train_loss,
+                "val_acc": avg_val_accuracy,
+                "lr": learning_rate,
             }
-            torch.save(checkpoint, last_ckpt_path)
+            torch.save(checkpoint, os.path.join(save_dir, "last.pt"))
 
-            if avg_val_acc > best_acc:
-                best_acc = avg_val_acc
+            if avg_val_accuracy > best_acc:
+                best_acc = avg_val_accuracy
                 best_epoch = epoch
-                best_ckpt_path = os.path.join(save_dir, "best.pt")
-                torch.save(checkpoint, best_ckpt_path)
-            checkpoint_time_seconds = time.perf_counter() - checkpoint_started
-            total_checkpoint_time_seconds += checkpoint_time_seconds
+                torch.save(checkpoint, os.path.join(save_dir, "best.pt"))
 
-            scheduler_started = time.perf_counter()
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(avg_val_acc)
+                scheduler.step(avg_val_accuracy)
             elif scheduler is not None:
                 scheduler.step()
-            scheduler_time_seconds = time.perf_counter() - scheduler_started
 
-            epoch_time_seconds = time.perf_counter() - epoch_started
-            gpu_memory_allocated = (
-                torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-                if device.type == "cuda" else 0.0
-            )
-            run.log(
-                {
-                    "epoch": epoch,
-                    "train/epoch_loss": avg_loss,
-                    "train/learning_rate": current_lr,
-                    "train/muon_learning_rate": current_lr,
-                    **(
-                        {"train/adam_learning_rate": current_adam_lr}
-                        if current_adam_lr is not None else {}
-                    ),
-                    "train/batches": processed_batches,
-                    "train/samples": processed_samples,
-                    "train/samples_per_second": (
-                        processed_samples / train_time_seconds
-                        if train_time_seconds > 0 else 0.0
-                    ),
-                    "validation/loss": avg_val_loss,
-                    "validation/accuracy": avg_val_acc,
-                    "validation/correct": correct,
-                    "validation/samples": total,
-                    "validation/samples_per_second": (
-                        total / validation_time_seconds if validation_time_seconds > 0 else 0.0
-                    ),
-                    "best/validation_accuracy": best_acc,
-                    "best/epoch": best_epoch,
-                    "timing/train_seconds": train_time_seconds,
-                    "timing/validation_seconds": validation_time_seconds,
-                    "timing/evaluation_seconds": validation_time_seconds,
-                    "timing/checkpoint_seconds": checkpoint_time_seconds,
-                    "timing/scheduler_seconds": scheduler_time_seconds,
-                    "timing/epoch_seconds": epoch_time_seconds,
-                    "timing/total_training_seconds": total_train_time_seconds,
-                    "timing/total_validation_seconds": total_validation_time_seconds,
-                    "timing/total_evaluation_seconds": total_validation_time_seconds,
-                    "timing/total_checkpoint_seconds": total_checkpoint_time_seconds,
-                    "teleport/attempted": attempted_teleports,
-                    "teleport/accepted": accepted_teleports,
-                    "teleport/acceptance_rate": (
-                        accepted_teleports / attempted_teleports if attempted_teleports else 0.0
-                    ),
-                    "system/gpu_peak_memory_mb": gpu_memory_allocated,
-                    "global_step": global_step,
-                }
-            )
-            if device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
-        activation_recorder.close()
-        run.log({"teleport/events": telemetry_table})
-        run.log({"teleport/candidates": candidate_table})
-        run.summary["best/validation_accuracy"] = best_acc
-        run.summary["best/epoch"] = best_epoch
-        run.summary["timing/total_training_seconds"] = total_train_time_seconds
-        run.summary["timing/total_validation_seconds"] = total_validation_time_seconds
-        run.summary["timing/total_evaluation_seconds"] = total_validation_time_seconds
-        run.summary["timing/total_checkpoint_seconds"] = total_checkpoint_time_seconds
-        run.summary["timing/run_seconds"] = time.perf_counter() - run_started
-        run.summary["teleport/attempted"] = attempted_teleports
-        run.summary["teleport/accepted"] = accepted_teleports
+            # One W&B write per epoch: no per-batch, sample, timing, diagnostics,
+            # teleportation-event, histogram, artifact, or candidate-table logging.
+            log_payload = {
+                "epoch": epoch,
+                "train/loss": avg_train_loss,
+                "validation/loss": avg_val_loss,
+                "validation/accuracy": avg_val_accuracy,
+            }
+            if args.opt == "muon":
+                log_payload["train/muon_learning_rate"] = learning_rate
+                if adam_learning_rate is not None:
+                    log_payload["train/adam_learning_rate"] = adam_learning_rate
+            else:
+                log_payload["train/learning_rate"] = learning_rate
+            run.log(log_payload, step=epoch)
 
 
 if __name__ == "__main__":

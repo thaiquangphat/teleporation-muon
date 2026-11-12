@@ -22,10 +22,9 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 AMP_DTYPE="${AMP_DTYPE:-none}"
 
 # -----------------------------------------------------------------------------
-# Step-based training
+# Step-based training and compact W&B logging
 # -----------------------------------------------------------------------------
 MAX_STEPS="${MAX_STEPS:-1000}"
-# Default to 5% warmup. Override with WARMUP_STEPS=0 to disable.
 WARMUP_STEPS="${WARMUP_STEPS:-$((MAX_STEPS / 20))}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-100}"
@@ -44,11 +43,7 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRAD_CLIP="${GRAD_CLIP:-0}"
 
 # -----------------------------------------------------------------------------
-# Step-based teleport schedule
-# TELE_INTERVAL=0 means one schedule covering the whole run.
-# TELE_LIMIT_STEP=0 means no upper step limit.
-# TELE_BATCH is the number of scheduled teleport steps per interval; TELE_CONS
-# controls how these attempts are grouped consecutively.
+# Teleportation settings
 # -----------------------------------------------------------------------------
 TELE_INTERVAL="${TELE_INTERVAL:-0}"
 TELE_START_STEP="${TELE_START_STEP:-1}"
@@ -65,7 +60,6 @@ TELE_MLP="${TELE_MLP:-0}"
 TELE_LAYER="${TELE_LAYER:-all}"
 TELE_OPT="${TELE_OPT:-1}"
 
-# Shared arguments ensure every method gets the same data and step budget.
 COMMON_ARGS=(
   --data-dir "$DATA_DIR"
   --dataset-source local
@@ -115,35 +109,55 @@ TELE_COMMON_ARGS=(
 )
 
 run_for_seeds() {
+  local method="$1"
+  shift
   local seed
   IFS=',' read -r -a seed_values <<< "$SEEDS"
   for seed in "${seed_values[@]}"; do
     echo "============================================================"
-    echo "Running seed=${seed}; max_steps=${MAX_STEPS}; train_fraction=${TRAIN_FRACTION}"
+    echo "Running method=${method} seed=${seed}; max_steps=${MAX_STEPS}; train_fraction=${TRAIN_FRACTION}"
     echo "============================================================"
     python3 src/lm/train.py \
       "${COMMON_ARGS[@]}" \
       --seed "$seed" \
+      --tele-method "$method" \
       "$@"
   done
 }
 
-# Plain Muon baseline: ordinary Muon momentum, no teleportation.
-run_for_seeds \
-  --tele-method none \
+# Plain Muon baseline.
+run_for_seeds none \
   --save-dir ./checkpoints-lm/plain
 
-# Naive teleportation: majority rule on gradient L2, ordinary Muon momentum.
-run_for_seeds \
-  --tele-method naive \
+# Naive teleportation: majority rule over global gradient L2.
+run_for_seeds naive \
   --n-teleport "$N_TELEPORT" \
   "${TELE_COMMON_ARGS[@]}" \
   --save-dir ./checkpoints-lm/naive
 
-# CSD-L2 with the same Nesterov direction used by the actual Muon update.
-run_for_seeds \
-  --nesterov \
-  --tele-method csd_l2_nesterov \
+# CSD-L2 on the ordinary EMA momentum buffer (no Nesterov flag).
+run_for_seeds csd_l2 \
   --tele-candidates "$TELE_CANDIDATES" \
   "${TELE_COMMON_ARGS[@]}" \
+  --save-dir ./checkpoints-lm/csd_l2
+
+# Nesterov CSD criteria all use the Nesterov-corrected direction.
+run_for_seeds csd_l2_nesterov \
+  --nesterov --tele-candidates "$TELE_CANDIDATES" \
+  "${TELE_COMMON_ARGS[@]}" \
   --save-dir ./checkpoints-lm/csd_l2_nesterov
+
+run_for_seeds csd_l2_nesterov_frobenius \
+  --nesterov --tele-candidates "$TELE_CANDIDATES" \
+  "${TELE_COMMON_ARGS[@]}" \
+  --save-dir ./checkpoints-lm/csd_l2_nesterov_frobenius
+
+run_for_seeds csd_l2_nesterov_post_orth \
+  --nesterov --tele-candidates "$TELE_CANDIDATES" \
+  "${TELE_COMMON_ARGS[@]}" \
+  --save-dir ./checkpoints-lm/csd_l2_nesterov_post_orth
+
+run_for_seeds csd_l2_nesterov_post_orth_frobenius \
+  --nesterov --tele-candidates "$TELE_CANDIDATES" \
+  "${TELE_COMMON_ARGS[@]}" \
+  --save-dir ./checkpoints-lm/csd_l2_nesterov_post_orth_frobenius
