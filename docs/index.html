@@ -84,121 +84,9 @@
       <div class="fact"><span class="fact-label">SETTINGS</span><strong>Vision + Language</strong><small>ViT and GPT-2</small></div>
     </section>
 
-    <section class="technical-section" id="framework">
-      <div class="shell section">
-        <div class="section-heading">
-          <div class="section-index">02 / TECHNICAL FRAMEWORK</div>
-          <h2>Change coordinates.<br><span>Preserve the computation.</span></h2>
-          <p class="heading-description technical-intro">Teleportation applies structured, invertible transformations to internal representations. The transformations are chosen so the network computes the same function, while the optimizer state is moved into the new coordinates.</p>
-        </div>
-
-        <div class="framework-grid">
-          <article class="framework-card">
-            <div class="framework-label">01 / ATTENTION SYMMETRY</div>
-            <h3>Keep query–key scores unchanged</h3>
-            <div class="formula-box">
-              <div>q′ = Mq</div>
-              <div>k′ = M<sup>−T</sup>k</div>
-              <div class="formula-result">q′<sup>T</sup>k′ = q<sup>T</sup>k</div>
-            </div>
-            <p>Reciprocal transformations preserve the query–key inner product. The allowed matrices are constrained by the positional encoding: RoPE uses pairwise block transformations, while APE permits per-head monomial transformations.</p>
-          </article>
-          <article class="framework-card">
-            <div class="framework-label">02 / MLP SYMMETRY</div>
-            <h3>Reparameterize hidden units</h3>
-            <div class="formula-box">
-              <div>W<sub>in</sub>′ = P D W<sub>in</sub></div>
-              <div>W<sub>out</sub>′ = W<sub>out</sub>D<sup>−1</sup>P<sup>T</sup></div>
-              <div class="formula-result">GPT-2 GELU: P only (D = I)</div>
-            </div>
-            <p>For the ReLU ViT blocks, P is a permutation and D is positive diagonal. GPT-2 uses permutation-only MLP transformations, since general positive rescaling does not commute with GELU.</p>
-          </article>
-          <article class="framework-card framework-state">
-            <div class="framework-label">03 / OPTIMIZER-STATE TRANSPORT</div>
-            <h3>Move momentum with the parameters</h3>
-            <div class="formula-box">
-              <div>B<sub>Q</sub>′ = M<sup>−T</sup>B<sub>Q</sub></div>
-              <div>B<sub>K</sub>′ = M B<sub>K</sub></div>
-              <div class="formula-result">B′ follows the new coordinates</div>
-            </div>
-            <p>For fused QKV, the value block is unchanged while query/key momentum is transported as shown. For transformed parameters handled by elementwise Adam states, affected states are reset rather than reused in incompatible coordinates.</p>
-          </article>
-        </div>
-
-        <div class="algorithm-panel">
-          <div class="algorithm-heading">
-            <div><div class="framework-label">THE SEARCH PROCEDURE</div><h3>Candidate evaluation and selection</h3></div>
-            <span class="algorithm-pill">CSD METHODS</span>
-          </div>
-          <div class="algorithm-layout">
-            <ol class="algorithm-list">
-              <li><span>01</span><div><b>Build candidates</b><small>Include identity T₀ = I and sample K−1 valid symmetries.</small></div></li>
-              <li><span>02</span><div><b>Evaluate independently</b><small>Clone model and optimizer; apply Tᵢ and transport its state.</small></div></li>
-              <li><span>03</span><div><b>Compute the score</b><small>Backpropagate on the same minibatch and evaluate Φ(Gᵢ, Bᵢ).</small></div></li>
-              <li><span>04</span><div><b>Select and commit</b><small>Choose T* = arg maxᵢ S(Tᵢ); transform the live model and state once.</small></div></li>
-            </ol>
-            <div class="algorithm-code"><div class="code-caption">PSEUDOCODE</div><pre><code><span>Input:</span> θ, B, batch, K, score Φ
-T₀ ← I;  T₁ … Tₖ₋₁ ← SampleSymmetries(K−1)
-
-<span>for each</span> Tᵢ:
-    (θᵢ, Bᵢ) ← Clone(θ, B)
-    (θᵢ, Bᵢ) ← TransformAndTransport(Tᵢ)
-    Gᵢ ← ∇<sub>θᵢ</sub> L(θᵢ; batch)
-    sᵢ ← Φ(Gᵢ, Bᵢ)
-
-T* ← arg maxᵢ sᵢ
-Commit(T*, θ, B)</code></pre></div>
-          </div>
-          <div class="algorithm-note"><span class="note-icon">i</span><p><b>Identity is always evaluated.</b> It remains the selected candidate when its score is maximal or tied, so the search can retain the current parameterization.</p></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="criteria-section" id="criteria">
-      <div class="shell section">
-        <div class="section-heading heading-light">
-          <div class="section-index">03 / SCORING</div>
-          <h2>Different views of<br><span>the Muon update.</span></h2>
-          <p class="heading-description">The repository compares several criteria for ranking symmetry candidates. The criteria vary in which optimizer direction they measure and which matrix norm they use.</p>
-        </div>
-        <div class="criteria-grid">
-          <article class="criterion-card criterion-baseline"><div class="criterion-top"><span class="criterion-number">A</span><span class="criterion-label">BASELINE</span></div><h3>Naive</h3><p>Global gradient L2 score with a majority-rule candidate selection.</p><div class="criterion-foot">Gradient norm</div></article>
-          <article class="criterion-card"><div class="criterion-top"><span class="criterion-number">B</span><span class="criterion-label">EMA</span></div><h3>CSD-L2</h3><p>Scores the ordinary EMA momentum direction using the nuclear norm.</p><div class="criterion-foot">Nuclear norm</div></article>
-          <article class="criterion-card"><div class="criterion-top"><span class="criterion-number">C</span><span class="criterion-label">PRE-ORTHOGONALIZATION</span></div><h3>Nesterov CSD</h3><p>Scores the Nesterov-corrected direction before Newton–Schulz, using nuclear or Frobenius norms.</p><div class="criterion-foot">Nuclear · Frobenius</div></article>
-          <article class="criterion-card"><div class="criterion-top"><span class="criterion-number">D</span><span class="criterion-label">POST-ORTHOGONALIZATION</span></div><h3>Post-NS CSD</h3><p>Scores the direction after Muon's Newton–Schulz orthogonalization.</p><div class="criterion-foot">Nuclear · Frobenius</div></article>
-        </div>
-        <div class="score-formulas">
-          <div class="score-formula">
-            <span class="formula-kicker">01 / EMA MOMENTUM · CSD-L2</span>
-            <div>B<sub>t</sub>(T) = βB<sub>t−1</sub>(T) + (1−β)G<sub>t</sub>(T)</div>
-            <small>Score the next ordinary momentum buffer with the nuclear norm.</small>
-            <div class="formula-mini">S<sub>EMA</sub>(T) = [ ∑<sub>ℓ</sub> ‖B<sub>ℓ,t</sub>(T)‖<sub>*</sub>² ]<sup>1/2</sup></div>
-          </div>
-          <div class="score-formula">
-            <span class="formula-kicker">02 / NESTEROV · PRE-NS</span>
-            <div>V<sub>t</sub>(T) = β²B<sub>t−1</sub>(T) + (1−β²)G<sub>t</sub>(T)</div>
-            <small>Score before Newton–Schulz using either matrix norm.</small>
-            <div class="formula-mini">S<sub>pre,ν</sub>(T) = [ ∑<sub>ℓ</sub> ‖V<sub>ℓ,t</sub>(T)‖<sub>ν</sub>² ]<sup>1/2</sup></div>
-          </div>
-          <div class="score-formula">
-            <span class="formula-kicker">03 / NESTEROV · POST-NS</span>
-            <div>U<sub>ℓ,t</sub>(T) = κ<sub>ℓ</sub> NS<sub>5</sub>(V<sub>ℓ,t</sub>(T))</div>
-            <small>NS₅ is Muon’s five-step Newton–Schulz zeropower transform; κ is its aspect-ratio multiplier.</small>
-            <div class="formula-mini">S<sub>post,ν</sub>(T) = [ ∑<sub>ℓ</sub> ‖U<sub>ℓ,t</sub>(T)‖<sub>ν</sub>² ]<sup>1/2</sup></div>
-          </div>
-          <div class="score-formula score-formula-select">
-            <span class="formula-kicker">04 / CANDIDATE SELECTION</span>
-            <div>T* = arg max<sub>T ∈ 𝒯</sub> S<sub>ν</sub>(T)</div>
-            <small>ν ∈ {*, F}: nuclear or Frobenius norm. The identity transformation is always included.</small>
-          </div>
-        </div>
-        <p class="criteria-note">For the LM experiments, Nesterov-based criteria are paired with the <code>--nesterov</code> optimizer option.</p>
-      </div>
-    </section>
-
     <section class="section shell" id="experiments">
       <div class="section-heading">
-        <div class="section-index">04 / EXPERIMENTS</div>
+        <div class="section-index">EXPERIMENTS</div>
         <h2>Two model families.<br><span>One research question.</span></h2>
       </div>
       <div class="tracks-grid">
@@ -211,27 +99,6 @@ Commit(T*, θ, B)</code></pre></div>
           <div class="track-content"><div class="track-meta">NEXT-TOKEN PREDICTION</div><h3>GPT-2 Language Modeling</h3><p>Extend the candidate search to GPT-2, with symmetry transformations for fused QKV attention projections and MLP layers.</p><div class="dataset-list"><span>GPT-2</span><span>WikiText-103</span><span>Muon + AdamW</span></div><a class="text-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/lm" target="_blank" rel="noreferrer">Explore LM implementation <b>↗</b></a></div>
         </article>
       </div>
-    </section>
-
-    <section class="run-section">
-      <div class="shell run-grid">
-        <div><div class="section-index">05 / GET STARTED</div><h2>Run the experiments.</h2><p>Clone the repository, install the dependencies, configure Weights & Biases, and launch either experiment suite.</p><a class="button button-primary" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">Open repository <span aria-hidden="true">↗</span></a></div>
-        <div class="run-code"><div class="code-top"><span><i></i><i></i><i></i></span><small>TERMINAL</small></div><pre><code><span class="code-muted"># Install</span>
-git clone https://github.com/thaiquangphat/teleporation-muon.git
-cd teleporation-muon
-python -m pip install -r requirements.txt
-
-<span class="code-muted"># Configure W&amp;B</span>
-cp wandb.yaml.example wandb.yaml
-
-<span class="code-muted"># Run the ViT experiment suite</span>
-bash scripts_vit.sh
-
-<span class="code-muted"># Run GPT-2 / WikiText experiments</span>
-bash data_wkt103.sh
-WIKITEXT_DATA_DIR="$HOME/data/wt103" bash scripts_lm.sh</code></pre></div>
-      </div>
-      <div class="shell run-footnote">ImageNet-1K requires separate dataset access and preparation. See the repository README for configuration details and individual run commands.</div>
     </section>
   </main>
 
