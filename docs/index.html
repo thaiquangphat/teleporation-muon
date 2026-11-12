@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101322">
+  <meta name="description" content="Muon Teleportation explores symmetry-preserving reparameterizations and optimizer-aware candidate search for Muon training in Vision Transformers and GPT-2.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Muon Teleportation">
+  <meta property="og:description" content="Symmetry-aware candidate search for Muon optimization across vision and language models.">
+  <meta property="og:image" content="https://thaiquangphat.github.io/teleporation-muon/assets/teaser.svg">
+  <title>Muon Teleportation — Symmetry-aware search for Muon</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <div class="page-noise" aria-hidden="true"></div>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Muon Teleportation home">
+      <span class="brand-mark">μ</span>
+      <span>MUON <b>TELEPORTATION</b></span>
+    </a>
+    <nav class="main-nav" aria-label="Main navigation">
+      <a href="#idea">Overview</a>
+      <a href="#criteria">Scoring</a>
+      <a href="#experiments">Experiments</a>
+    </nav>
+    <a class="nav-code" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">
+      <span>Source code</span><span aria-hidden="true">↗</span>
+    </a>
+  </header>
+
+  <main id="top">
+    <section class="hero shell">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="eyebrow-dot"></span> OPTIMIZER-AWARE REPARAMETERIZATION</div>
+        <h1>Muon<br><span class="gradient-word">Teleportation</span></h1>
+        <p class="hero-lead">Exploring symmetry-preserving transformations as a search space for Muon optimization.</p>
+        <p class="hero-description">Can we move a model to an equivalent parameterization where Muon finds a more useful update direction? This project investigates that question through candidate generation, optimizer-aware scoring, and state transport.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">Explore the code <span aria-hidden="true">↗</span></a>
+          <a class="button button-quiet" href="#idea">How it works <span aria-hidden="true">↓</span></a>
+        </div>
+        <div class="hero-tags" aria-label="Project areas">
+          <span>Vision Transformers</span><i></i><span>GPT-2</span><i></i><span>Muon</span>
+        </div>
+      </div>
+
+      <div class="hero-visual-wrap">
+        <div class="visual-kicker"><span>FIG. 01</span><span>SYMMETRY SEARCH</span></div>
+        <div class="hero-visual">
+          <div class="visual-topline"><span class="live-dot"></span> FUNCTION-PRESERVING SEARCH</div>
+          <div class="state-card state-source">
+            <span class="card-label">STARTING MODEL</span>
+            <div class="state-symbol">θ</div>
+            <span class="state-caption">Current parameters</span>
+          </div>
+          <div class="connector connector-a"><span>T</span></div>
+          <div class="candidate-area">
+            <div class="candidate-heading"><span>SYMMETRY CANDIDATES</span><span class="candidate-count">T₁ — Tₖ</span></div>
+            <div class="candidate-row">
+              <div class="candidate candidate-one"><span class="candidate-id">T₁</span><span class="candidate-bars"><i></i><i></i><i></i><i></i></span><span class="candidate-score">S₁</span></div>
+              <div class="candidate candidate-two"><span class="candidate-id">T₂</span><span class="candidate-bars"><i></i><i></i><i></i><i></i></span><span class="candidate-score">S₂</span></div>
+              <div class="candidate candidate-three"><span class="candidate-id">T₃</span><span class="candidate-bars"><i></i><i></i><i></i><i></i></span><span class="candidate-score">S₃</span></div>
+            </div>
+            <div class="score-line"><span></span><b>MUON-DIRECTION SCORING</b><span></span></div>
+            <div class="selection-card"><span class="selection-check">✓</span><span><small>SELECTED CANDIDATE</small><strong>T*</strong></span><span class="selection-arrow">↗</span></div>
+          </div>
+          <div class="visual-equation"><span>f<sub>θ′</sub>(x) = f<sub>θ</sub>(x)</span><small>equivalent function · new coordinates</small></div>
+          <div class="visual-orbit orbit-one"></div><div class="visual-orbit orbit-two"></div>
+        </div>
+        <div class="visual-caption"><span class="caption-bar"></span> Search over equivalent parameterizations, then transport the optimizer state.</div>
+      </div>
+    </section>
+
+    <section class="quick-facts shell" aria-label="Project summary">
+      <div class="fact"><span class="fact-label">CORE IDEA</span><strong>Function-preserving</strong><small>parameter transformations</small></div>
+      <div class="fact"><span class="fact-label">SEARCH</span><strong>Candidate-based</strong><small>score and select</small></div>
+      <div class="fact"><span class="fact-label">OPTIMIZER</span><strong>Muon</strong><small>with transported momentum</small></div>
+      <div class="fact"><span class="fact-label">SETTINGS</span><strong>Vision + Language</strong><small>ViT and GPT-2</small></div>
+    </section>
+
+    <section class="section shell" id="idea">
+      <div class="section-heading">
+        <div class="section-index">01 / OVERVIEW</div>
+        <h2>Same function.<br><span>Different coordinates.</span></h2>
+      </div>
+      <div class="overview-grid">
+        <p class="overview-lead">Neural networks can have multiple parameterizations that represent the same function. Teleportation uses these symmetries to explore different coordinates without intentionally changing the model's input-output mapping.</p>
+        <div class="steps">
+          <article class="step"><div class="step-number">01</div><div><h3>Generate</h3><p>Sample symmetry-preserving transformations for attention and MLP components.</p></div></article>
+          <article class="step"><div class="step-number">02</div><div><h3>Evaluate</h3><p>Apply each candidate to a cloned model, compute its Muon-related score, and rank the candidates.</p></div></article>
+          <article class="step"><div class="step-number">03</div><div><h3>Transport</h3><p>Commit the selected transformation and transport the corresponding Muon momentum state.</p></div></article>
+        </div>
+      </div>
+      <div class="note-strip"><span class="note-icon">i</span><p><b>Important:</b> candidate selection is based on the chosen direction score, not simply on minimizing the current minibatch loss.</p></div>
+    </section>
+
+    <section class="criteria-section" id="criteria">
+      <div class="shell section">
+        <div class="section-heading heading-light">
+          <div class="section-index">02 / SCORING</div>
+          <h2>Different views of<br><span>the Muon update.</span></h2>
+          <p class="heading-description">The repository compares several criteria for ranking symmetry candidates. The criteria vary in which optimizer direction they measure and which matrix norm they use.</p>
+        </div>
+        <div class="criteria-grid">
+          <article class="criterion-card criterion-baseline"><div class="criterion-top"><span class="criterion-number">A</span><span class="criterion-label">BASELINE</span></div><h3>Naive</h3><p>Global gradient L2 score with a majority-rule candidate selection.</p><div class="criterion-foot">Gradient norm</div></article>
+          <article class="criterion-card"><div class="criterion-top"><span class="criterion-number">B</span><span class="criterion-label">EMA</span></div><h3>CSD-L2</h3><p>Scores the ordinary EMA momentum direction using the nuclear norm.</p><div class="criterion-foot">Nuclear norm</div></article>
+          <article class="criterion-card"><div class="criterion-top"><span class="criterion-number">C</span><span class="criterion-label">PRE-ORTHOGONALIZATION</span></div><h3>Nesterov CSD</h3><p>Scores the Nesterov-corrected direction before Newton–Schulz, using nuclear or Frobenius norms.</p><div class="criterion-foot">Nuclear · Frobenius</div></article>
+          <article class="criterion-card"><div class="criterion-top"><span class="criterion-number">D</span><span class="criterion-label">POST-ORTHOGONALIZATION</span></div><h3>Post-NS CSD</h3><p>Scores the direction after Muon's Newton–Schulz orthogonalization.</p><div class="criterion-foot">Nuclear · Frobenius</div></article>
+        </div>
+        <p class="criteria-note">For the LM experiments, Nesterov-based criteria are paired with the <code>--nesterov</code> optimizer option.</p>
+      </div>
+    </section>
+
+    <section class="section shell" id="experiments">
+      <div class="section-heading">
+        <div class="section-index">03 / EXPERIMENTS</div>
+        <h2>Two model families.<br><span>One research question.</span></h2>
+      </div>
+      <div class="tracks-grid">
+        <article class="track-card track-vit">
+          <div class="track-art art-vit" aria-hidden="true"><div class="patch-grid"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><div class="art-label">VISION / 01</div></div>
+          <div class="track-content"><div class="track-meta">IMAGE CLASSIFICATION</div><h3>Vision Transformers</h3><p>Study symmetry-based teleportation in ViT attention and MLP components, including RoPE-aware attention transformations.</p><div class="dataset-list"><span>MNIST</span><span>CIFAR-10</span><span>CIFAR-100</span><span>ImageNet-1K</span></div><a class="text-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/vit" target="_blank" rel="noreferrer">Explore ViT implementation <b>↗</b></a></div>
+        </article>
+        <article class="track-card track-lm">
+          <div class="track-art art-lm" aria-hidden="true"><div class="token-flow"><span>the</span><span>model</span><span>learns</span><span>...</span></div><div class="art-wave"></div><div class="art-label">LANGUAGE / 02</div></div>
+          <div class="track-content"><div class="track-meta">NEXT-TOKEN PREDICTION</div><h3>GPT-2 Language Modeling</h3><p>Extend the candidate search to GPT-2, with symmetry transformations for fused QKV attention projections and MLP layers.</p><div class="dataset-list"><span>GPT-2</span><span>WikiText-103</span><span>Muon + AdamW</span></div><a class="text-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/lm" target="_blank" rel="noreferrer">Explore LM implementation <b>↗</b></a></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="run-section">
+      <div class="shell run-grid">
+        <div><div class="section-index">04 / GET STARTED</div><h2>Run the experiments.</h2><p>Clone the repository, install the dependencies, configure Weights & Biases, and launch either experiment suite.</p><a class="button button-primary" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">Open repository <span aria-hidden="true">↗</span></a></div>
+        <div class="run-code"><div class="code-top"><span><i></i><i></i><i></i></span><small>TERMINAL</small></div><pre><code><span class="code-muted"># Install</span>
+git clone https://github.com/thaiquangphat/teleporation-muon.git
+cd teleporation-muon
+python -m pip install -r requirements.txt
+
+<span class="code-muted"># Configure W&amp;B</span>
+cp wandb.yaml.example wandb.yaml
+
+<span class="code-muted"># Run the ViT experiment suite</span>
+bash scripts_vit.sh
+
+<span class="code-muted"># Run GPT-2 / WikiText experiments</span>
+bash data_wkt103.sh
+WIKITEXT_DATA_DIR="$HOME/data/wt103" bash scripts_lm.sh</code></pre></div>
+      </div>
+      <div class="shell run-footnote">ImageNet-1K requires separate dataset access and preparation. See the repository README for configuration details and individual run commands.</div>
+    </section>
+  </main>
+
+  <footer class="site-footer shell">
+    <a class="brand footer-brand" href="#top"><span class="brand-mark">μ</span><span>MUON <b>TELEPORTATION</b></span></a>
+    <span class="footer-caption">An experimental codebase for symmetry-aware Muon optimization.</span>
+    <a href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">GitHub ↗</a>
+  </footer>
+</body>
+</html>
