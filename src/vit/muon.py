@@ -1,3 +1,4 @@
+
 """Single-device Muon optimizer adapted from Keller Jordan's Muon repository.
 
 Copyright (c) 2024 Keller Jordan
@@ -16,11 +17,7 @@ copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 """
 
 import torch
@@ -41,9 +38,15 @@ def _zeropower_via_newtonschulz5(gradient, steps=5):
     return update.mT if transposed else update
 
 
-def _muon_update(gradient, momentum_buffer, beta):
+def _muon_update(gradient, momentum_buffer, beta, nesterov=False):
+    """Compute the Muon update using EMA or Nesterov momentum."""
     momentum_buffer.lerp_(gradient, 1 - beta)
-    update = gradient.lerp(momentum_buffer, beta)
+
+    if nesterov:
+        update = gradient.lerp(momentum_buffer, beta)
+    else:
+        update = momentum_buffer
+
     if update.ndim == 4:
         update = update.flatten(1)
     update = _zeropower_via_newtonschulz5(update)
@@ -66,18 +69,24 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
         for group in param_groups:
             if "use_muon" not in group:
                 raise ValueError("Every Muon optimizer parameter group needs 'use_muon'.")
+
             if group["use_muon"]:
                 group.setdefault("lr", 0.02)
                 group.setdefault("momentum", 0.95)
+                group.setdefault("nesterov", False)
                 group.setdefault("weight_decay", 0)
+
+                if not isinstance(group["nesterov"], bool):
+                    raise TypeError("Muon group 'nesterov' must be a bool.")
             else:
                 group.setdefault("lr", 3e-4)
                 group.setdefault("betas", (0.9, 0.95))
                 group.setdefault("eps", 1e-10)
                 group.setdefault("weight_decay", 0)
+
         super().__init__(param_groups, {})
-        # Set by create_muon_optimizer. Diagnostics are opt-in and are
-        # collected inside the real update to avoid replaying Newton--Schulz.
+
+        # Diagnostics are collected inside the actual optimizer update.
         self.diagnostics_enabled = False
         self.last_step_diagnostics = {}
         self._diagnostic_parameter_names = {}
@@ -87,6 +96,7 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
         loss = None
         if self.diagnostics_enabled:
             self.last_step_diagnostics = {}
+
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
@@ -97,69 +107,131 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     continue
 
                 state = self.state[parameter]
+
                 if group["use_muon"]:
+                    beta = float(group["momentum"])
+                    nesterov = group["nesterov"]
                     diagnostic_values = None
+
                     if self.diagnostics_enabled:
-                        beta = float(group["momentum"])
                         gradient = parameter.grad.detach()
                         previous = state.get("momentum_buffer")
+
                         if torch.is_tensor(previous):
                             previous_for_metrics = previous.detach()
                         else:
                             previous_for_metrics = torch.zeros_like(gradient)
-                        next_momentum = previous_for_metrics.lerp(gradient, 1.0 - beta)
-                        raw_direction = gradient.lerp(next_momentum, beta)
+
+                        next_momentum = previous_for_metrics.lerp(
+                            gradient, 1.0 - beta
+                        )
+                        raw_nesterov_direction = gradient.lerp(
+                            next_momentum, beta
+                        )
+                        actual_raw_direction = (
+                            raw_nesterov_direction
+                            if nesterov
+                            else next_momentum
+                        )
+
                         diagnostic_values = {
-                            "gradient_frobenius": float(gradient.float().norm().item()),
-                            "momentum_before_frobenius": float(previous_for_metrics.float().norm().item()),
-                            "momentum_gradient_cosine": float(torch.nn.functional.cosine_similarity(
-                                previous_for_metrics.float().reshape(1, -1),
-                                gradient.float().reshape(1, -1), dim=1, eps=1e-12
-                            ).item()),
-                            "raw_nesterov_direction_frobenius": float(raw_direction.float().norm().item()),
+                            "nesterov_enabled": float(nesterov),
+                            "gradient_frobenius": float(
+                                gradient.float().norm().item()
+                            ),
+                            "momentum_before_frobenius": float(
+                                previous_for_metrics.float().norm().item()
+                            ),
+                            "momentum_gradient_cosine": float(
+                                torch.nn.functional.cosine_similarity(
+                                    previous_for_metrics.float().reshape(1, -1),
+                                    gradient.float().reshape(1, -1),
+                                    dim=1,
+                                    eps=1e-12,
+                                ).item()
+                            ),
+                            "raw_nesterov_direction_frobenius": float(
+                                raw_nesterov_direction.float().norm().item()
+                            ),
+                            "actual_raw_direction_frobenius": float(
+                                actual_raw_direction.float().norm().item()
+                            ),
                         }
+
                     if not state:
                         state["momentum_buffer"] = torch.zeros_like(parameter)
+
                     update = _muon_update(
                         parameter.grad,
                         state["momentum_buffer"],
-                        beta=group["momentum"],
+                        beta=beta,
+                        nesterov=nesterov,
                     )
+
                     if diagnostic_values is not None:
                         update_for_metrics = update.reshape(parameter.shape).float()
                         parameter_float = parameter.detach().float()
                         gradient_float = parameter.grad.detach().float()
                         momentum_after = state["momentum_buffer"].detach().float()
+
                         lr = float(group["lr"])
                         weight_decay = float(group["weight_decay"])
-                        actual_delta = -lr * (update_for_metrics + weight_decay * parameter_float)
+                        actual_delta = -lr * (
+                            update_for_metrics + weight_decay * parameter_float
+                        )
+
                         diagnostic_values.update({
-                            "momentum_after_frobenius": float(momentum_after.norm().item()),
-                            "muon_direction_frobenius": float(update.float().norm().item()),
-                            "gradient_muon_cosine": float(torch.nn.functional.cosine_similarity(
-                                gradient_float.reshape(1, -1), update_for_metrics.reshape(1, -1), dim=1, eps=1e-12
-                            ).item()),
-                            "raw_nesterov_muon_direction_cosine": float(torch.nn.functional.cosine_similarity(
-                                raw_direction.float().reshape(1, -1), update_for_metrics.reshape(1, -1),
-                                dim=1, eps=1e-12
-                            ).item()),
-                            "weight_muon_cosine": float(torch.nn.functional.cosine_similarity(
-                                parameter_float.reshape(1, -1), update_for_metrics.reshape(1, -1), dim=1, eps=1e-12
-                            ).item()),
-                            "actual_update_frobenius": float(actual_delta.norm().item()),
+                            "momentum_after_frobenius": float(
+                                momentum_after.norm().item()
+                            ),
+                            "muon_direction_frobenius": float(
+                                update.float().norm().item()
+                            ),
+                            "gradient_muon_cosine": float(
+                                torch.nn.functional.cosine_similarity(
+                                    gradient_float.reshape(1, -1),
+                                    update_for_metrics.reshape(1, -1),
+                                    dim=1,
+                                    eps=1e-12,
+                                ).item()
+                            ),
+                            "raw_nesterov_muon_direction_cosine": float(
+                                torch.nn.functional.cosine_similarity(
+                                    raw_nesterov_direction.float().reshape(1, -1),
+                                    update_for_metrics.reshape(1, -1),
+                                    dim=1,
+                                    eps=1e-12,
+                                ).item()
+                            ),
+                            "weight_muon_cosine": float(
+                                torch.nn.functional.cosine_similarity(
+                                    parameter_float.reshape(1, -1),
+                                    update_for_metrics.reshape(1, -1),
+                                    dim=1,
+                                    eps=1e-12,
+                                ).item()
+                            ),
+                            "actual_update_frobenius": float(
+                                actual_delta.norm().item()
+                            ),
                             "relative_update_norm": float(
-                                actual_delta.norm().item() / max(parameter_float.norm().item(), 1e-12)
+                                actual_delta.norm().item()
+                                / max(parameter_float.norm().item(), 1e-12)
                             ),
                         })
+
                         parameter_name = self._diagnostic_parameter_names.get(
-                            id(parameter), f"parameter_{len(self.last_step_diagnostics)}"
+                            id(parameter),
+                            f"parameter_{len(self.last_step_diagnostics)}",
                         )
                         self.last_step_diagnostics[parameter_name] = diagnostic_values
+
                 else:
                     if not state:
                         state["exp_avg"] = torch.zeros_like(parameter)
                         state["exp_avg_sq"] = torch.zeros_like(parameter)
                         state["step"] = 0
+
                     state["step"] += 1
                     update = _adam_update(
                         parameter.grad,
@@ -176,8 +248,23 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
         return loss
 
 
-def create_muon_optimizer(model, lr, weight_decay, momentum=0.95, adam_lr=3e-4):
-    """Use Muon for transformer matrix weights and AdamW for the remaining weights."""
+def create_muon_optimizer(
+    model,
+    lr,
+    weight_decay,
+    momentum=0.95,
+    adam_lr=3e-4,
+    nesterov=False,
+):
+    """Use Muon for matrix weights and AdamW for remaining parameters.
+
+    Args:
+        nesterov: If False, use the EMA momentum direction.
+                  If True, use the Nesterov-corrected direction.
+    """
+    if not isinstance(nesterov, bool):
+        raise TypeError("nesterov must be a bool.")
+
     muon_parameters = []
     adam_parameters = []
     adam_only_name_parts = ("embedding", "classifier", "pooler")
@@ -201,6 +288,7 @@ def create_muon_optimizer(model, lr, weight_decay, momentum=0.95, adam_lr=3e-4):
                 "use_muon": True,
                 "lr": lr,
                 "momentum": momentum,
+                "nesterov": nesterov,
                 "weight_decay": weight_decay,
             },
             {
@@ -213,6 +301,7 @@ def create_muon_optimizer(model, lr, weight_decay, momentum=0.95, adam_lr=3e-4):
             },
         ]
     )
+
     optimizer._diagnostic_parameter_names = {
         id(parameter): name for name, parameter in model.named_parameters()
     }

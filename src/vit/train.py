@@ -15,6 +15,12 @@ from model import ViTRoPEForImageClassification
 from muon import create_muon_optimizer
 from teleport import generate_tele_scheduler, try_teleportation
 
+NESTEROV_CSD_METHODS = {
+    "csd_l2_nesterov",
+    "csd_l2_nesterov_frobenius",
+    "csd_l2_nesterov_post_orth",
+    "csd_l2_nesterov_post_orth_frobenius",
+}
 
 def list_of_ints(arg):
     return [int(x) for x in arg.split(",")]
@@ -49,6 +55,11 @@ def parse_args():
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for the auxiliary AdamW group when --opt=muon.")
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument(
+        "--nesterov",
+        action="store_true",
+        help="Use Nesterov-corrected Muon updates instead of ordinary EMA Muon.",
+    )
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["step", "cosine", "plateau"])
     parser.add_argument("--n-teleport", type=int, default=0, help="number of naive teleport candidates")
     parser.add_argument("--tele-batch", type=int, default=32, help="Number of batch per Tele")
@@ -117,17 +128,19 @@ def build_optimizer(model, args):
         weight_decay=args.weight_decay,
         momentum=args.momentum,
         adam_lr=args.adam_lr,
+        nesterov=args.nesterov,
     )
 
 
 def build_run_name(args):
     adam_lr_suffix = f"_adam-lr{args.adam_lr}" if args.opt == "muon" else ""
+    nesterov_suffix = "_nesterov" if args.nesterov else ""
     if args.tele_method == "none" and args.n_teleport <= 0:
         return (
-            f"NoTeleport-lr{args.lr}{adam_lr_suffix}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
+            f"NoTeleport-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
         )
     return (
-        f"Teleport-{args.tele_method}-lr{args.lr}{adam_lr_suffix}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
+        f"Teleport-{args.tele_method}-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
         f"att{args.tele_att}_mlp{args.tele_mlp}_"
         f"tele-opt{args.tele_opt}_tele-high{args.tele_high}_tele-low{args.tele_low}_tele-cons{args.tele_cons}_tele-sign{args.tele_sign}_"
         f"tele-layer{args.tele_layer}_tele-batch{args.tele_batch}_tele-epoch{args.tele_epoch_array}_cands{args.tele_candidates}_seed{args.seed}"
@@ -166,6 +179,17 @@ def load_wandb_settings(args):
 
 def main():
     args = parse_args()
+    if args.nesterov and args.opt != "muon":
+        raise ValueError("--nesterov requires --opt muon.")
+
+    if args.tele_method in NESTEROV_CSD_METHODS:
+        if args.opt != "muon":
+            raise ValueError("Nesterov CSD methods require --opt muon.")
+        if not args.nesterov:
+            raise ValueError(
+                "Nesterov CSD methods require --nesterov so the optimizer update "
+                "matches the direction used for CSD scoring."
+            )
 
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True

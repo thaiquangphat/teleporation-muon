@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -e
 
@@ -40,45 +41,49 @@ TELE_ARGS=(
     --tele-cons 4
     --tele-high 1.65
     --tele-low 0.35
-    --tele-epoch-array 1,5
+    --tele-epoch-array 1
 )
 
-# CIFAR-100: plain Muon baseline.
+# CIFAR-100: plain Muon baseline (ordinary EMA).
 run_for_seeds "${COMMON_ARGS[@]}" \
     --save_dir ./checkpoints-vit/plain
 
-# CIFAR-100: naive teleportation Muon.
+# CIFAR-100: naive teleportation Muon (ordinary EMA).
 run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
     --tele-method naive \
-    --n-teleport 16 \
+    --n-teleport 6 \
     --save_dir ./checkpoints-vit/naive
 
-# CIFAR-100: CSD-L2 Muon teleportation.
+# CIFAR-100: CSD-L2 Muon teleportation (EMA scoring).
 run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
     --tele-method csd_l2 \
     --tele-candidates 6 \
     --save_dir ./checkpoints-vit/csd_l2
 
-# CIFAR-100: CSD-L2-Nesterov Muon teleportation.
+# CIFAR-100: CSD-L2-Nesterov with nuclear norm scoring.
 run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
     --tele-method csd_l2_nesterov \
+    --nesterov \
     --tele-candidates 6 \
     --save_dir ./checkpoints-vit/csd_l2_nesterov
 
 # CIFAR-100: CSD-L2-Nesterov with Frobenius norm scoring.
 run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
     --tele-method csd_l2_nesterov_frobenius \
+    --nesterov \
     --tele-candidates 6 \
     --save_dir ./checkpoints-vit/csd_l2_nesterov_frobenius
 
-# CIFAR-100: CSD-L2-Nesterov with post-orthogonalization scoring.
+# CIFAR-100: CSD-L2-Nesterov with post-orthogonalization nuclear norm scoring.
 run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
     --tele-method csd_l2_nesterov_post_orth \
+    --nesterov \
     --tele-candidates 6 \
     --save_dir ./checkpoints-vit/csd_l2_nesterov_post_orth
 
-    # CIFAR-100: CSD-L2-Nesterov with post-orthogonalization Frobenius scoring.
+# CIFAR-100: CSD-L2-Nesterov with post-orthogonalization Frobenius scoring.
 run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
     --tele-method csd_l2_nesterov_post_orth_frobenius \
+    --nesterov \
     --tele-candidates 6 \
     --save_dir ./checkpoints-vit/csd_l2_nesterov_post_orth_frobenius
