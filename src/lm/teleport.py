@@ -144,12 +144,11 @@ def gen_ape_inv_matrix(
     tele_low: float,
     tele_sign: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """APE-compatible block-diagonal monomial transform.
+    """Generate the same per-head monomial APE transform used by ``src/vit``.
 
-    APE imposes no post-projection rotation commutant constraint. We retain the
-    repository's established per-head monomial family (permutation plus
-    nonzero coordinate scales), repeated over heads. This is a safe subset of
-    all invertible per-head APE Q/K transformations.
+    Positive coordinate magnitudes are sampled from [low, high], followed by
+    independent row/column permutations. The same per-head matrix is repeated
+    across heads, matching the current ViT candidate generator.
     """
     low, high = validate_bounds(tele_low, tele_high)
     diagonal = torch.rand(d_head, dtype=torch.float32) * (high - low) + low
@@ -157,9 +156,8 @@ def gen_ape_inv_matrix(
         signs = torch.randint(0, 2, (d_head,), dtype=torch.int64).float() * 2.0 - 1.0
         diagonal = diagonal * signs
     base = torch.diag(diagonal)
-    row_perm = torch.randperm(d_head)
-    col_perm = torch.randperm(d_head)
-    matrix = base[row_perm, :][:, col_perm].contiguous()
+    base = base[torch.randperm(d_head), :]
+    matrix = base[:, torch.randperm(d_head)].contiguous()
 
     inverse = torch.zeros_like(matrix)
     rows, cols = torch.nonzero(matrix, as_tuple=True)
@@ -174,7 +172,7 @@ def gen_rope_inv_matrix(
     tele_low: float,
     tele_sign: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-head scaled 2x2 rotations commuting with adjacent-pair RoPE."""
+    """Generate per-head scaled 2x2 rotations commuting with adjacent-pair RoPE."""
     low, high = validate_bounds(tele_low, tele_high)
     if d_head % 2:
         raise ValueError(f"RoPE requires even head dimension, got {d_head}")
@@ -188,27 +186,44 @@ def gen_rope_inv_matrix(
             scales = scales * signs
         blocks, inverse_blocks = [], []
         for theta, rho in zip(angles, scales):
-            c, s = torch.cos(theta), torch.sin(theta)
-            blocks.append(torch.stack((torch.stack((rho * c, -rho * s)),
-                                       torch.stack((rho * s, rho * c)))))
+            c, sn = torch.cos(theta), torch.sin(theta)
+            blocks.append(torch.stack((torch.stack((rho * c, -rho * sn)),
+                                       torch.stack((rho * sn, rho * c)))))
             inv_rho = 1.0 / rho
-            inverse_blocks.append(torch.stack((torch.stack((inv_rho * c, inv_rho * s)),
-                                               torch.stack((-inv_rho * s, inv_rho * c)))))
+            inverse_blocks.append(torch.stack((torch.stack((inv_rho * c, inv_rho * sn)),
+                                                torch.stack((-inv_rho * sn, inv_rho * c)))))
         matrices.append(torch.block_diag(*blocks))
         inverses.append(torch.block_diag(*inverse_blocks))
     return _block_diag(matrices), _block_diag(inverses)
 
 
 def gen_mlp_permutation(dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """A permutation and its inverse; exact for any elementwise activation."""
+    """Permutation symmetry, valid for any elementwise activation."""
     permutation = torch.eye(dim, dtype=torch.float32)[:, torch.randperm(dim)]
     return permutation, permutation.mT.contiguous()
+
+
+def gen_mlp_inv_matrix(
+    dim: int,
+    tele_high: float,
+    tele_low: float,
+    activation_function: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use positive monomial transforms for ReLU, permutations otherwise.
+
+    Positive rescaling commutes with ReLU by positive homogeneity. For GELU
+    and the other non-homogeneous activations, only hidden-unit permutations
+    are used as exact symmetries.
+    """
+    if str(activation_function).lower() == "relu":
+        return gen_ape_inv_matrix(1, dim, tele_high, tele_low, tele_sign=0)
+    return gen_mlp_permutation(dim)
 
 
 def attention_blocks(model: nn.Module, tele_layer: str) -> List[nn.Module]:
     layers = list(model.transformer.h)
     if not layers:
-        raise ValueError("The GPT-2 model has no transformer blocks")
+        raise ValueError("The LM model has no transformer blocks")
     if tele_layer == "all":
         return layers
     if tele_layer == "first":
@@ -218,14 +233,17 @@ def attention_blocks(model: nn.Module, tele_layer: str) -> List[nn.Module]:
     raise ValueError(f"Unsupported tele_layer: {tele_layer}")
 
 
-def qkv_modules(model: nn.Module, tele_layer: str) -> List[nn.Linear]:
-    return [block.attn.c_attn for block in attention_blocks(model, tele_layer)]
+def qk_linear_modules(model: nn.Module, tele_layer: str) -> List[Tuple[nn.Linear, nn.Linear]]:
+    return [
+        (block.attn.query, block.attn.key)
+        for block in attention_blocks(model, tele_layer)
+    ]
 
 
 def _matrix_scale_summary(matrix: Optional[torch.Tensor]) -> List[float]:
     if matrix is None:
         return []
-    return torch.linalg.vector_norm(matrix.float(), dim=1).detach().cpu().tolist()
+    return torch.linalg.vector_norm(matrix.float(), ord=2, dim=1).detach().cpu().tolist()
 
 
 def generate_symmetry_candidates(
@@ -236,6 +254,7 @@ def generate_symmetry_candidates(
     count: int,
     seed: int,
 ) -> List[Dict[str, Any]]:
+    """Generate identity plus candidates using the same conventions as ViT."""
     validate_bounds(low, high)
     use_attention = bool(getattr(args, "tele_att", 1))
     use_mlp = bool(getattr(args, "tele_mlp", 0))
@@ -247,7 +266,6 @@ def generate_symmetry_candidates(
     d_head = int(config.n_embd // config.n_head)
     mlp_dim = int(model.transformer.h[0].mlp.c_fc.out_features)
     use_rope = model.position_embedding == "rope"
-
     original_rng = capture_rng_state()
     candidates: List[Dict[str, Any]] = []
     try:
@@ -279,20 +297,23 @@ def generate_symmetry_candidates(
                     matrix = torch.eye(mlp_dim, dtype=torch.float32)
                     inverse = matrix.clone()
                 else:
-                    # GPT-2 uses GELU. Only permutations commute with GELU;
-                    # positive coordinate scaling is not a GELU symmetry.
-                    matrix, inverse = gen_mlp_permutation(mlp_dim)
+                    matrix, inverse = gen_mlp_inv_matrix(
+                        mlp_dim,
+                        high,
+                        low,
+                        config.activation_function,
+                    )
                 candidate["M_mlp"], candidate["M_mlp_inv"] = matrix, inverse
 
             candidate["attention_scale_summary"] = _matrix_scale_summary(candidate["M_att"])
             candidate["mlp_scale_summary"] = _matrix_scale_summary(candidate["M_mlp"])
             candidate["scale_summary"] = (
-                candidate["attention_scale_summary"]
-                if use_attention else candidate["mlp_scale_summary"]
+                candidate["attention_scale_summary"] if use_attention
+                else candidate["mlp_scale_summary"]
             )
-            scales = candidate["attention_scale_summary"] + candidate["mlp_scale_summary"]
-            candidate["scale_min"] = min(scales) if scales else 1.0
-            candidate["scale_max"] = max(scales) if scales else 1.0
+            all_scales = candidate["attention_scale_summary"] + candidate["mlp_scale_summary"]
+            candidate["scale_min"] = min(all_scales) if all_scales else 1.0
+            candidate["scale_max"] = max(all_scales) if all_scales else 1.0
             candidate["transform_type"] = "gpt2_rope_block" if use_rope else "gpt2_ape_monomial"
             candidates.append(candidate)
     finally:
@@ -303,28 +324,31 @@ def generate_symmetry_candidates(
     return candidates
 
 
-def teleportation_att(model: nn.Module, matrix: torch.Tensor, matrix_inv: torch.Tensor, tele_layer: str) -> None:
-    """Apply Q'=M Q, K'=M^{-T}K to fused GPT-2 QKV linear projections."""
-    hidden_size = int(model.config.n_embd)
-    for block in attention_blocks(model, tele_layer):
-        projection = block.attn.c_attn
-        transform = matrix.to(device=projection.weight.device, dtype=projection.weight.dtype)
-        inverse = matrix_inv.to(device=projection.weight.device, dtype=projection.weight.dtype)
+def teleportation_att(
+    model: nn.Module,
+    matrix: torch.Tensor,
+    matrix_inv: torch.Tensor,
+    tele_layer: str,
+) -> None:
+    """Apply the ViT-style Q/K symmetry to separate causal-LM projections.
+
+    V and the attention output projection intentionally remain unchanged,
+    matching the current ViT implementation and the author's reference code.
+    """
+    for query, key in qk_linear_modules(model, tele_layer):
+        transform = matrix.to(device=query.weight.device, dtype=query.weight.dtype)
+        inverse = matrix_inv.to(device=key.weight.device, dtype=key.weight.dtype)
         with torch.no_grad():
-            q_weight = projection.weight[:hidden_size].clone()
-            k_weight = projection.weight[hidden_size : 2 * hidden_size].clone()
-            projection.weight[:hidden_size].copy_(transform @ q_weight)
-            projection.weight[hidden_size : 2 * hidden_size].copy_(inverse.mT @ k_weight)
-            if projection.bias is not None:
-                q_bias = projection.bias[:hidden_size].clone()
-                k_bias = projection.bias[hidden_size : 2 * hidden_size].clone()
-                projection.bias[:hidden_size].copy_(transform @ q_bias)
-                projection.bias[hidden_size : 2 * hidden_size].copy_(inverse.mT @ k_bias)
-            # V weight and bias are unchanged.
+            query.weight.copy_(transform @ query.weight)
+            key.weight.copy_(inverse.mT @ key.weight)
+            if query.bias is not None:
+                query.bias.copy_(transform @ query.bias)
+            if key.bias is not None:
+                key.bias.copy_(inverse.mT @ key.bias)
 
 
 def teleportation_mlp(model: nn.Module, matrix: torch.Tensor, matrix_inv: torch.Tensor) -> None:
-    """Apply a GELU-preserving hidden-unit permutation to every GPT-2 block."""
+    """Apply an activation-compatible hidden-unit symmetry to every MLP block."""
     for block in model.transformer.h:
         fc = block.mlp.c_fc
         proj = block.mlp.c_proj
@@ -335,7 +359,7 @@ def teleportation_mlp(model: nn.Module, matrix: torch.Tensor, matrix_inv: torch.
             if fc.bias is not None:
                 fc.bias.copy_(transform @ fc.bias)
             proj.weight.copy_(proj.weight @ inverse)
-            # c_proj.bias is in the residual stream and is unchanged.
+            # proj.bias is in the residual stream and is unchanged.
 
 
 def apply_symmetry_candidate(model: nn.Module, candidate: Dict[str, Any], args: Any) -> None:
@@ -343,6 +367,80 @@ def apply_symmetry_candidate(model: nn.Module, candidate: Dict[str, Any], args: 
         teleportation_att(model, candidate["M_att"], candidate["M_att_inv"], args.tele_layer)
     if bool(getattr(args, "tele_mlp", 0)):
         teleportation_mlp(model, candidate["M_mlp"], candidate["M_mlp_inv"])
+
+
+def teleportation_parameter_items(
+    model: nn.Module, args: Any
+) -> List[Tuple[str, nn.Parameter]]:
+    """List all parameters whose coordinates are changed by the active symmetry."""
+    items: List[Tuple[str, nn.Parameter]] = []
+    if bool(getattr(args, "tele_att", 1)):
+        for name, parameter in model.named_parameters():
+            for layer_index, _block in enumerate(model.transformer.h):
+                if args.tele_layer == "first" and layer_index != 0:
+                    continue
+                if args.tele_layer == "last" and layer_index != len(model.transformer.h) - 1:
+                    continue
+                prefix = f"transformer.h.{layer_index}.attn."
+                if name in {
+                    prefix + "query.weight", prefix + "query.bias",
+                    prefix + "key.weight", prefix + "key.bias",
+                }:
+                    items.append((name, parameter))
+    if bool(getattr(args, "tele_mlp", 0)):
+        for layer_index, _block in enumerate(model.transformer.h):
+            prefix = f"transformer.h.{layer_index}.mlp."
+            for suffix in ("c_fc.weight", "c_fc.bias", "c_proj.weight"):
+                name = prefix + suffix
+                parameter = dict(model.named_parameters()).get(name)
+                if parameter is not None:
+                    items.append((name, parameter))
+
+    unique: List[Tuple[str, nn.Parameter]] = []
+    seen = set()
+    for name, parameter in items:
+        if id(parameter) not in seen:
+            unique.append((name, parameter))
+            seen.add(id(parameter))
+    return unique
+
+
+def teleportation_matrix_parameter_names(model: nn.Module, args: Any) -> set[str]:
+    """Names of transformed matrix weights included in CSD candidate scoring."""
+    return {
+        name for name, parameter in teleportation_parameter_items(model, args)
+        if parameter.ndim >= 2 and name.endswith(".weight")
+    }
+
+
+def _transform_momentum_left(
+    optimizer: torch.optim.Optimizer,
+    parameter: nn.Parameter,
+    transform: torch.Tensor,
+) -> None:
+    state = optimizer.state.get(parameter)
+    if not state:
+        return
+    momentum = state.get("momentum_buffer")
+    if torch.is_tensor(momentum):
+        matrix = transform.to(device=momentum.device, dtype=momentum.dtype)
+        with torch.no_grad():
+            momentum.copy_(matrix @ momentum)
+
+
+def _transform_momentum_right(
+    optimizer: torch.optim.Optimizer,
+    parameter: nn.Parameter,
+    transform: torch.Tensor,
+) -> None:
+    state = optimizer.state.get(parameter)
+    if not state:
+        return
+    momentum = state.get("momentum_buffer")
+    if torch.is_tensor(momentum):
+        matrix = transform.to(device=momentum.device, dtype=momentum.dtype)
+        with torch.no_grad():
+            momentum.copy_(momentum @ matrix)
 
 
 def create_lm_muon_optimizer(
@@ -354,22 +452,22 @@ def create_lm_muon_optimizer(
     adam_weight_decay: Optional[float] = None,
     nesterov: bool = False,
 ) -> torch.optim.Optimizer:
-    """Muon for GPT-2 block matrices; AdamW for embeddings, biases and norms."""
+    """Use Muon for Transformer block matrices and AdamW for embeddings/biases/norms.
+
+    This mirrors ``src/vit/muon.py``: hidden Transformer matrices are Muon
+    parameters, while token/position embeddings and one-dimensional parameters
+    use the auxiliary AdamW group.
+    """
     muon_parameters: List[nn.Parameter] = []
     adam_parameters: List[nn.Parameter] = []
-    muon_suffixes = (
-        ".attn.c_attn.weight",
-        ".attn.c_proj.weight",
-        ".mlp.c_fc.weight",
-        ".mlp.c_proj.weight",
-    )
     for name, parameter in model.named_parameters():
-        is_block_matrix = parameter.ndim == 2 and name.startswith("transformer.h.") and name.endswith(muon_suffixes)
-        (muon_parameters if is_block_matrix else adam_parameters).append(parameter)
+        is_hidden_matrix = parameter.ndim >= 2 and name.startswith("transformer.h.")
+        (muon_parameters if is_hidden_matrix else adam_parameters).append(parameter)
+
     if not muon_parameters:
-        raise ValueError("No GPT-2 transformer matrices were assigned to Muon")
+        raise ValueError("No Transformer block matrices were assigned to Muon")
     if not adam_parameters:
-        raise ValueError("No GPT-2 embedding/bias/normalization parameters were assigned to AdamW")
+        raise ValueError("No embedding/bias/normalization parameters were assigned to AdamW")
 
     optimizer = SingleDeviceMuonWithAuxAdam(
         [
@@ -391,8 +489,6 @@ def create_lm_muon_optimizer(
             },
         ]
     )
-    # Keep readable names outside optimizer state_dicts for criterion metadata;
-    # cloned optimizers reconstruct the same mapping automatically.
     optimizer.parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
     return optimizer
 
@@ -403,35 +499,24 @@ def transport_teleportation_optimizer_state(
     candidate: Dict[str, Any],
     args: Any,
 ) -> None:
-    """Transport Muon buffers and reset affected elementwise Adam states.
+    """Transport Muon EMA buffers and reset only affected Adam states.
 
-    The fused QKV momentum buffer has row blocks [Q;K;V]. For the parameter
-    transformations W_Q'=M W_Q and W_K'=M^{-T}W_K, its gradient-like momentum
-    transforms as B_Q'=M^{-T}B_Q and B_K'=M B_K. V is unchanged.
+    For Q'=M Q and K'=M^{-T}K, gradient-like momentum transforms as
+    B_Q'=M^{-T}B_Q and B_K'=M B_K. MLP state follows the same covector rule.
     """
     if bool(candidate.get("identity", False)):
         return
 
-    hidden_size = int(model.config.n_embd)
     if bool(getattr(args, "tele_att", 1)):
         matrix = candidate["M_att"]
         matrix_inv = candidate["M_att_inv"]
-        for block in attention_blocks(model, args.tele_layer):
-            projection = block.attn.c_attn
-            state = optimizer.state.get(projection.weight, {})
-            momentum = state.get("momentum_buffer")
-            if torch.is_tensor(momentum):
-                transform = matrix.to(device=momentum.device, dtype=momentum.dtype)
-                inverse = matrix_inv.to(device=momentum.device, dtype=momentum.dtype)
-                with torch.no_grad():
-                    q_buffer = momentum[:hidden_size].clone()
-                    k_buffer = momentum[hidden_size : 2 * hidden_size].clone()
-                    momentum[:hidden_size].copy_(inverse.mT @ q_buffer)
-                    momentum[hidden_size : 2 * hidden_size].copy_(transform @ k_buffer)
-            # Q/K bias coordinates changed but are slices of one Adam tensor;
-            # reset that state rather than retaining stale elementwise moments.
-            if projection.bias is not None:
-                optimizer.state.pop(projection.bias, None)
+        for query, key in qk_linear_modules(model, args.tele_layer):
+            _transform_momentum_left(optimizer, query.weight, matrix_inv.mT)
+            _transform_momentum_left(optimizer, key.weight, matrix)
+            if query.bias is not None:
+                optimizer.state.pop(query.bias, None)
+            if key.bias is not None:
+                optimizer.state.pop(key.bias, None)
 
     if bool(getattr(args, "tele_mlp", 0)):
         matrix = candidate["M_mlp"]
@@ -439,18 +524,8 @@ def transport_teleportation_optimizer_state(
         for block in model.transformer.h:
             fc = block.mlp.c_fc
             proj = block.mlp.c_proj
-            fc_state = optimizer.state.get(fc.weight, {})
-            fc_momentum = fc_state.get("momentum_buffer")
-            if torch.is_tensor(fc_momentum):
-                inverse = matrix_inv.to(device=fc_momentum.device, dtype=fc_momentum.dtype)
-                with torch.no_grad():
-                    fc_momentum.copy_(inverse.mT @ fc_momentum)
-            proj_state = optimizer.state.get(proj.weight, {})
-            proj_momentum = proj_state.get("momentum_buffer")
-            if torch.is_tensor(proj_momentum):
-                transform = matrix.to(device=proj_momentum.device, dtype=proj_momentum.dtype)
-                with torch.no_grad():
-                    proj_momentum.copy_(proj_momentum @ transform.mT)
+            _transform_momentum_left(optimizer, fc.weight, matrix_inv.mT)
+            _transform_momentum_right(optimizer, proj.weight, matrix.mT)
             if fc.bias is not None:
                 optimizer.state.pop(fc.bias, None)
 
@@ -544,6 +619,17 @@ def _try_scored_teleportation_impl(
             "construct the optimizer with --nesterov."
         )
 
+    score_scope = str(getattr(args, "csd_score_scope", "all_muon"))
+    if score_scope == "all_muon":
+        # Exact parity with src/vit criteria: score every matrix in the Muon group.
+        scoring_parameter_names = None
+    elif score_scope == "transformed":
+        scoring_parameter_names = teleportation_matrix_parameter_names(model, args)
+        if not scoring_parameter_names:
+            raise ValueError("The active teleportation configuration has no transformed Muon matrices to score")
+    else:
+        raise ValueError("csd_score_scope must be 'all_muon' or 'transformed'")
+
     was_training = model.training
     committed = False
     try:
@@ -572,7 +658,7 @@ def _try_scored_teleportation_impl(
             candidate_optimizer.zero_grad(set_to_none=True)
             loss = _loss_for_batch(candidate_model, batch, criterion, args)
             loss.backward()
-            metrics = metrics_fn(candidate_optimizer)
+            metrics = metrics_fn(candidate_optimizer, parameter_names=scoring_parameter_names)
             score = float(metrics["score"])
             if not math.isfinite(score):
                 raise ValueError(f"Non-finite {method_name} score for candidate {index}")
@@ -598,6 +684,9 @@ def _try_scored_teleportation_impl(
                 "norm_kind": str(metrics["norm_kind"]),
                 "momentum_direction": str(metrics["momentum_direction"]),
                 "beta": float(metrics["beta"]),
+                "scoring_parameter_scope": (
+                    "all_muon_matrices" if score_scope == "all_muon" else "transformed_muon_matrices"
+                ),
                 f"{prefix}_score": score,
                 f"{prefix}_squared_score": float(metrics["squared_score"]),
                 f"{prefix}_matrix_count": int(metrics["matrix_count"]),
@@ -695,6 +784,9 @@ def _try_scored_teleportation_impl(
             "transform_family": selected_candidate["transform_type"],
             "uses_attention": bool(getattr(args, "tele_att", 1)),
             "uses_mlp": bool(getattr(args, "tele_mlp", 0)),
+            "scoring_parameter_scope": (
+                "all_muon_matrices" if score_scope == "all_muon" else "transformed_muon_matrices"
+            ),
             "proposed_candidate_index": int(best_alternative["candidate_index"]),
             "accepted_candidate_index": selected_index if accepted else None,
             "num_candidates_evaluated": len(results),
@@ -844,6 +936,8 @@ __all__ = [
     "create_lm_muon_optimizer",
     "generate_tele_scheduler",
     "generate_symmetry_candidates",
+    "teleportation_parameter_items",
+    "teleportation_matrix_parameter_names",
     "teleportation_att",
     "teleportation_mlp",
     "transport_teleportation_optimizer_state",

@@ -13,12 +13,15 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import wandb
+try:
+    import wandb
+except ImportError:  # allows --help and model utilities without optional W&B install
+    wandb = None
 import yaml
 from tqdm import tqdm
 
 from datamodule import get_wikitext_dataloaders
-from model import GPT2LMForCausalLM
+from model import GPT2LMConfig, GPT2LMForCausalLM
 from teleport import create_lm_muon_optimizer, generate_tele_scheduler, try_teleportation
 
 
@@ -42,13 +45,30 @@ NESTEROV_CSD_TELE_METHODS = CSD_TELE_METHODS - {"csd_l2"}
 TELEPORT_METHODS = {"naive", *CSD_TELE_METHODS}
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Step-based GPT-2 CSD-Muon on WikiText")
+    parser = argparse.ArgumentParser(description="Step-based configurable causal-LM Muon/CSD teleportation on WikiText")
     parser.add_argument("--data-dir", type=str, default="./data/wt103")
     parser.add_argument("--dataset-source", type=str, default="local", choices=["local", "huggingface"])
     parser.add_argument("--cache-dir", type=str, default=None)
     parser.add_argument("--dataset-config", type=str, default="wikitext-103-raw-v1")
-    parser.add_argument("--model-name", type=str, default="gpt2")
-    parser.add_argument("--position-embedding", type=str, default="ape", choices=["ape", "rope"])
+    parser.add_argument("--model-name", type=str, default="gpt2", help="Tokenizer source; model weights are scratch-initialized by default.")
+    parser.add_argument(
+        "--position-embedding", type=str, default="sinusoidal_ape",
+        choices=["ape", "learned", "learnable", "learned_ape", "sinusoidal_ape", "rope"],
+        help="Position encoding: learned APE, fixed sinusoidal APE, or RoPE.",
+    )
+    parser.add_argument("--d-model", "--d_model", "--n-embd", "--n_embd", dest="d_model", type=int, default=128)
+    parser.add_argument("--num-hidden-layers", "--n-layer", "--n_layer", dest="num_hidden_layers", type=int, default=16)
+    parser.add_argument("--num-heads", "--n-head", "--n_head", dest="num_heads", type=int, default=8)
+    parser.add_argument("--intermediate-size", "--d-inner", "--d_inner", dest="intermediate_size", type=int, default=2048)
+    parser.add_argument("--max-position-embeddings", type=int, default=1024)
+    parser.add_argument("--activation", type=str, default="relu", choices=["relu", "gelu", "gelu_new", "silu"])
+    parser.add_argument("--dropout", type=float, default=0.1, help="Embedding and residual dropout")
+    parser.add_argument("--attention-dropout", type=float, default=0.0)
+    parser.add_argument("--layer-norm-epsilon", type=float, default=1e-5)
+    parser.add_argument(
+        "--pretrained-init", action="store_true",
+        help="Initialize from a compatible Hugging Face GPT-2 checkpoint; otherwise train from scratch.",
+    )
     parser.add_argument("--block-size", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=4)
@@ -105,12 +125,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tele-mlp", type=int, default=0)
     parser.add_argument("--tele-layer", type=str, default="all", choices=["all", "first", "last"])
     parser.add_argument("--tele-candidates", type=int, default=6)
+    parser.add_argument("--csd-score-scope", choices=["all_muon", "transformed"], default="all_muon", help="CSD matrix scope; all_muon matches src/vit.")
     parser.add_argument("--n-teleport", type=int, default=6, help="Total naive candidates, including identity")
-    parser.add_argument("--tele-high", type=float, default=1.65)
-    parser.add_argument("--tele-low", type=float, default=0.35)
+    parser.add_argument("--tele-high", type=float, default=1.1)
+    parser.add_argument("--tele-low", type=float, default=0.9)
     parser.add_argument("--tele-sign", type=int, default=0)
-    parser.add_argument("--tele-batch", type=int, default=4, help="Teleport attempts per teleport scheduling window")
-    parser.add_argument("--tele-cons", type=int, default=4)
+    parser.add_argument("--tele-batch", type=int, default=32, help="Teleport attempts per teleport scheduling window")
+    parser.add_argument("--tele-cons", type=int, default=16)
     parser.add_argument("--tele-opt", type=int, default=1, choices=[0, 1])
     parser.add_argument("--tele-interval", type=int, default=0, help="Teleport scheduling window in steps; 0 means the full run")
     parser.add_argument("--tele-start-step", type=int, default=1, help="First eligible optimizer step for teleportation (1-based)")
@@ -130,6 +151,8 @@ def set_seed(seed: int) -> None:
 
 
 def load_wandb_settings(args: argparse.Namespace) -> tuple[str, Optional[str], str]:
+    if wandb is None:
+        raise ImportError("Training requires wandb. Install requirements.txt or use the configured environment.")
     config_path = os.environ.get("WANDB_CONFIG_PATH", "./wandb.yaml")
     file_config = {}
     if os.path.isfile(config_path):
@@ -173,6 +196,68 @@ def build_optimizer(model: nn.Module, args: argparse.Namespace) -> torch.optim.O
     )
 
 
+def build_model(
+    args: argparse.Namespace,
+    tokenizer,
+    device: torch.device,
+) -> tuple[GPT2LMForCausalLM, dict[str, object]]:
+    """Construct the configurable LM, following ViT's build_model pattern."""
+    if args.pretrained_init:
+        model, report = GPT2LMForCausalLM.from_pretrained(
+            model_name=args.model_name,
+            position_embedding=args.position_embedding,
+            cache_dir=args.cache_dir,
+        )
+        expected = (
+            int(args.d_model),
+            int(args.num_hidden_layers),
+            int(args.num_heads),
+            int(args.intermediate_size),
+        )
+        actual = (
+            int(model.config.n_embd),
+            int(model.config.n_layer),
+            int(model.config.n_head),
+            int(model.config.n_inner or 4 * model.config.n_embd),
+        )
+        if expected != actual:
+            raise ValueError(
+                "--pretrained-init requires model dimensions matching the checkpoint. "
+                f"Requested (d_model, layers, heads, inner)={expected}; checkpoint has {actual}."
+            )
+        if len(tokenizer) != model.config.vocab_size:
+            raise ValueError(
+                f"Tokenizer vocabulary ({len(tokenizer)}) does not match checkpoint "
+                f"vocabulary ({model.config.vocab_size})."
+            )
+    else:
+        config = GPT2LMConfig(
+            vocab_size=len(tokenizer),
+            n_positions=int(args.max_position_embeddings),
+            n_embd=int(args.d_model),
+            n_layer=int(args.num_hidden_layers),
+            n_head=int(args.num_heads),
+            n_inner=int(args.intermediate_size),
+            embd_pdrop=float(args.dropout),
+            attn_pdrop=float(args.attention_dropout),
+            resid_pdrop=float(args.dropout),
+            layer_norm_epsilon=float(args.layer_norm_epsilon),
+            activation_function=str(args.activation),
+        )
+        model = GPT2LMForCausalLM(config, position_embedding=args.position_embedding)
+        report = {
+            "checkpoint": None,
+            "pretrained_weights_loaded": False,
+            "initialization": "scratch",
+        }
+    if args.block_size > model.config.n_positions:
+        raise ValueError(
+            f"block_size={args.block_size} exceeds configured context length "
+            f"n_positions={model.config.n_positions}"
+        )
+    return model.to(device), report
+
+
 def build_run_name(args: argparse.Namespace) -> str:
     model_tag = args.model_name.replace("/", "-")
     if args.tele_method == "naive":
@@ -191,6 +276,8 @@ def build_run_name(args: argparse.Namespace) -> str:
         teleport_tag = ""
     return (
         f"WikiText-{args.dataset_config}-{model_tag}-{args.position_embedding}-"
+        f"d{args.d_model}-L{args.num_hidden_layers}-H{args.num_heads}-I{args.intermediate_size}-"
+        f"act{args.activation}-drop{args.dropout}-attdrop{args.attention_dropout}-"
         f"{args.opt}-lr{args.lr}-adam{args.adam_lr}-bs{args.batch_size}-"
         f"block{args.block_size}-frac{args.train_fraction:g}-dseed{args.data_seed}-"
         f"steps{args.max_steps}-warmup{args.warmup_steps}-eval{args.eval_interval}-"
@@ -370,22 +457,7 @@ def main() -> None:
     save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(save_dir, exist_ok=True)
 
-    model, load_report = GPT2LMForCausalLM.from_pretrained(
-        model_name=args.model_name,
-        position_embedding=args.position_embedding,
-        cache_dir=args.cache_dir,
-    )
-    if args.block_size > model.config.n_positions:
-        raise ValueError(
-            f"block_size={args.block_size} exceeds GPT-2 context length "
-            f"n_positions={model.config.n_positions}"
-        )
-    if len(tokenizer) != model.config.vocab_size:
-        raise ValueError(
-            f"Tokenizer vocabulary ({len(tokenizer)}) does not match GPT-2 embedding "
-            f"vocabulary ({model.config.vocab_size}). Avoid adding tokenizer tokens."
-        )
-    model = model.to(device)
+    model, load_report = build_model(args, tokenizer, device)
     optimizer = build_optimizer(model, args)
     base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
     if args.lr_scheduler == "plateau":
@@ -402,13 +474,14 @@ def main() -> None:
 
     selected_train_tokens = int(data_sizes.get("train_selected_tokens", data_sizes.get("train_tokens", 0)))
     tokens_per_full_batch = args.batch_size * args.block_size
-    print("\n========== GPT-2 WIKITEXT CONFIGURATION ==========")
+    print("\n========== CAUSAL LM WIKITEXT CONFIGURATION ==========")
     print("Device:", device)
-    print("Position embedding:", args.position_embedding)
-    print("Pretrained checkpoint:", args.model_name)
-    print("Checkpoint load report:", load_report)
+    print("Position embedding:", model.position_embedding)
+    print("Tokenizer:", args.model_name)
+    print("Initialization:", load_report)
     print("Model parameters:", sum(p.numel() for p in model.parameters()))
-    print("GPT-2 hidden/layers/heads:", model.config.n_embd, model.config.n_layer, model.config.n_head)
+    print("Model width/layers/heads/FFN:", model.config.n_embd, model.config.n_layer, model.config.n_head, model.config.n_inner)
+    print("Activation/dropout/attention dropout:", model.config.activation_function, model.config.resid_pdrop, model.config.attn_pdrop)
     print("Train/validation/test sizes:", data_sizes)
     print("Effective train tokens:", selected_train_tokens)
     print("Train fraction:", args.train_fraction)
@@ -416,7 +489,7 @@ def main() -> None:
     print("Tokens per full batch:", tokens_per_full_batch)
     print("Approx. tokens at max steps:", args.max_steps * tokens_per_full_batch)
     print("Warmup/evaluation/log intervals:", args.warmup_steps, args.eval_interval, args.log_interval)
-    print("=================================================\n")
+    print("=======================================================\n")
 
     with wandb.init(
         project=project,

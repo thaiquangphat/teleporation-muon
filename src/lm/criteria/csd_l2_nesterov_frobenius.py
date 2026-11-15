@@ -2,26 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
-from .common import aggregate_norms, muon_groups, muon_matrix_view, nesterov_direction, parameter_name
+from .common import (
+    aggregate_norms,
+    iter_scored_muon_matrices,
+    muon_groups,
+    muon_matrix_view,
+    nesterov_direction,
+)
 
 
-def nesterov_frobenius_metrics_from_optimizer(optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
+def nesterov_frobenius_metrics_from_optimizer(
+    optimizer: torch.optim.Optimizer,
+    parameter_names: Optional[set[str]] = None,
+) -> Dict[str, object]:
     groups = muon_groups(optimizer)
     beta = float(groups[0].get("momentum", 0.9))
     norms: List[float] = []
     names: List[str] = []
-    for group in groups:
-        for parameter in group["params"]:
-            if parameter.ndim < 2 or parameter.grad is None:
-                continue
-            direction = nesterov_direction(parameter, optimizer, beta)
-            norm = float(torch.linalg.vector_norm(muon_matrix_view(direction), ord=2).item())
-            norms.append(norm)
-            names.append(parameter_name(optimizer, parameter, len(names)))
+    for name, parameter, _ in iter_scored_muon_matrices(optimizer, parameter_names):
+        direction = nesterov_direction(parameter, optimizer, beta)
+        norm = float(torch.linalg.vector_norm(muon_matrix_view(direction), ord=2).item())
+        norms.append(norm)
+        names.append(name)
     return aggregate_norms(
         norms, names, "frobenius", "nesterov_corrected_pre_newton_schulz", beta
     )

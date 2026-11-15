@@ -145,15 +145,6 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
             self._pending_step_diagnostics.append((entry_name, keys, values))
 
         enqueue(name, weight32, grad32, momentum32, raw32, update32, actual_delta)
-        # Muon acts on the fused GPT-2 c_attn matrix. These blockwise
-        # diagnostics expose its Q/K/V components without changing that update.
-        if name.endswith(".attn.c_attn.weight") and weight32.ndim == 2 and weight32.shape[0] % 3 == 0:
-            hidden = weight32.shape[0] // 3
-            for label, rows in (("Q", slice(0, hidden)), ("K", slice(hidden, 2 * hidden)), ("V", slice(2 * hidden, 3 * hidden))):
-                enqueue(
-                    f"{name}/{label}", weight32[rows], grad32[rows], momentum32[rows],
-                    raw32[rows], update32[rows], actual_delta[rows],
-                )
 
     def _flush_step_diagnostics(self):
         if not self._pending_step_diagnostics:
@@ -234,26 +225,21 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
 
 
 def create_muon_optimizer(
-    model, lr, weight_decay, momentum=0.95, adam_lr=3e-4, nesterov=False
+    model, lr, weight_decay, momentum=0.9, adam_lr=5e-5, nesterov=False
 ):
-    """Use Muon for transformer matrix weights and AdamW for other weights."""
+    """Use Muon for Transformer block matrices and AdamW for other parameters."""
     muon_parameters = []
     adam_parameters = []
-    adam_only_name_parts = ("embedding", "classifier", "pooler")
-
     for name, parameter in model.named_parameters():
-        is_hidden_matrix = (
-            parameter.ndim >= 2
-            and not any(part in name.lower() for part in adam_only_name_parts)
-        )
+        is_hidden_matrix = parameter.ndim >= 2 and name.startswith("transformer.h.")
         (muon_parameters if is_hidden_matrix else adam_parameters).append(parameter)
 
     if not muon_parameters:
-        raise ValueError("Muon requires at least one eligible matrix parameter.")
+        raise ValueError("Muon requires at least one eligible Transformer matrix parameter.")
     if not adam_parameters:
-        raise ValueError("Muon requires at least one parameter for its AdamW group.")
+        raise ValueError("Muon requires at least one parameter for its auxiliary AdamW group.")
 
-    return SingleDeviceMuonWithAuxAdam(
+    optimizer = SingleDeviceMuonWithAuxAdam(
         [
             {
                 "params": muon_parameters,
@@ -273,3 +259,5 @@ def create_muon_optimizer(
             },
         ]
     )
+    optimizer.parameter_names = {id(parameter): name for name, parameter in model.named_parameters()}
+    return optimizer

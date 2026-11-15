@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Iterator, Optional
 
 import torch
 from torch import nn
 
 
 def model_gradient_l2(model: nn.Module) -> float:
-    """Global Euclidean norm of all available parameter gradients."""
+    """Global Euclidean norm of all available parameter gradients (naive rule)."""
     squared_norm = 0.0
     active = 0
     for parameter in model.parameters():
@@ -50,6 +50,36 @@ def muon_matrix_view(tensor: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Muon parameter must be matrix-valued, got {tuple(tensor.shape)}")
 
 
+def parameter_name(optimizer: torch.optim.Optimizer, parameter: nn.Parameter, index: int) -> str:
+    """Read readable parameter names installed by the LM optimizer factory."""
+    return str(getattr(optimizer, "parameter_names", {}).get(id(parameter), f"parameter_{index}"))
+
+
+def iter_scored_muon_matrices(
+    optimizer: torch.optim.Optimizer,
+    parameter_names: Optional[set[str]] = None,
+) -> Iterator[tuple[str, nn.Parameter, float]]:
+    """Iterate Muon matrices, optionally restricting scoring to transformed weights.
+
+    ``parameter_names=None`` preserves the historical all-Muon-matrices scope.
+    The LM teleportation search supplies the exact names changed by its active
+    symmetry, so Q/K (and optional MLP matrices) are scored without unrelated
+    matrices diluting the candidate objective.
+    """
+    groups = muon_groups(optimizer)
+    index = 0
+    for group in groups:
+        beta = float(group.get("momentum", 0.9))
+        for parameter in group["params"]:
+            name = parameter_name(optimizer, parameter, index)
+            index += 1
+            if parameter.ndim < 2 or parameter.grad is None:
+                continue
+            if parameter_names is not None and name not in parameter_names:
+                continue
+            yield name, parameter, beta
+
+
 def ema_momentum_direction(
     parameter: nn.Parameter,
     optimizer: torch.optim.Optimizer,
@@ -70,9 +100,10 @@ def nesterov_direction(
 ) -> torch.Tensor:
     """Compute the actual pre-Newton--Schulz Muon Nesterov direction.
 
-    The stored state is the previous EMA buffer B_(t-1). The upcoming step
-    first forms B_t = beta B_(t-1) + (1-beta)G_t and then uses
-    V_t = (1-beta)G_t + beta B_t = beta^2 B_(t-1) + (1-beta^2)G_t.
+    Stored state is B_(t-1). The upcoming update forms
+    B_t = beta B_(t-1) + (1-beta)G_t and uses
+    V_t = (1-beta)G_t + beta B_t
+        = beta^2 B_(t-1) + (1-beta^2)G_t.
     """
     gradient = parameter.grad.detach().float()
     previous = optimizer.state.get(parameter, {}).get("momentum_buffer")
@@ -95,7 +126,7 @@ def aggregate_norms(
     norm_values = [float(value) for value in norms]
     names = [str(value) for value in matrix_names]
     if not norm_values:
-        raise RuntimeError("No Muon matrix parameters received gradients; cannot score candidates.")
+        raise RuntimeError("No selected Muon matrix parameters received gradients.")
     if not all(math.isfinite(value) for value in norm_values):
         raise ValueError(f"{norm_kind} criterion produced a non-finite matrix norm.")
     squared_sum = sum(value * value for value in norm_values)
@@ -111,8 +142,3 @@ def aggregate_norms(
         "momentum_direction": momentum_direction,
         "beta": float(beta),
     }
-
-
-def parameter_name(optimizer: torch.optim.Optimizer, parameter: nn.Parameter, index: int) -> str:
-    """Read optional human-readable names installed by the LM optimizer factory."""
-    return str(getattr(optimizer, "parameter_names", {}).get(id(parameter), f"parameter_{index}"))
