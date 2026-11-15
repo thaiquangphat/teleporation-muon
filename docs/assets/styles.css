@@ -52,3 +52,38 @@
 .score-formula .formula-mini{border-top:1px solid rgba(255,255,255,.11);margin-top:10px;padding-top:10px;color:#d0ccff;font:10px/1.7 var(--mono);white-space:normal}
 .score-formula-select{background:rgba(129,119,240,.11);border-color:rgba(165,157,255,.28)}
 @media(max-width:640px){.score-formula .formula-mini{font-size:9px}}
+
+/* Results table and interactive training curves */
+.results-section{background:#f0f1f9;border-block:1px solid #e5e7f1}
+.results-section .section{padding-top:94px;padding-bottom:96px}
+.results-intro{max-width:700px;color:#737b91;font-size:12px;line-height:1.8;margin:17px 0 0}
+.results-panel,.chart-card{background:#fff;border:1px solid #e2e5ef;border-radius:11px;box-shadow:0 10px 28px rgba(39,43,78,.035)}
+.results-panel{padding:23px 24px 21px}
+.results-panel-heading,.curves-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:18px}
+.panel-kicker{font:8px var(--mono);letter-spacing:.12em;color:#8179d6}
+.results-panel-heading h3,.curves-heading h3{font-size:20px;letter-spacing:-.04em;margin:7px 0 0}
+.panel-note,.band-key{font:9px var(--mono);color:#8b91a4}
+.results-table-wrap{width:100%;overflow-x:auto}
+.results-table{border-collapse:collapse;width:100%;min-width:760px;text-align:center;font-size:10px;font-variant-numeric:tabular-nums}
+.results-table th,.results-table td{padding:13px 10px;border-bottom:1px solid #edf0f5;white-space:nowrap}
+.results-table thead th{font:8px var(--mono);letter-spacing:.035em;color:#737b91;background:#f8f9fc}
+.results-table thead tr:first-child th{color:#555d75;font-size:9px}
+.results-table tbody th{font-weight:800;text-align:left;color:#30374d}
+.results-table tbody td{color:#687087}
+.results-table .best{font-weight:800;color:#3d4380}
+.results-table .dataset-break th,.results-table .dataset-break td{border-top:2px solid #dfe3ef}
+.results-table tbody tr:last-child td{border-bottom:0}
+.curves-heading{margin:48px 0 18px}
+.curves-heading p{font-size:10px;color:#858ca0;margin:8px 0 0;line-height:1.6}
+.band-key{display:flex;align-items:center;gap:8px;white-space:nowrap;padding-bottom:2px}
+.band-key i{display:inline-block;width:18px;height:9px;border-radius:2px;background:rgba(111,126,207,.17);border:1px solid rgba(111,126,207,.24)}
+.charts-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.chart-card{padding:19px 19px 12px;min-width:0}
+.chart-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.chart-card-head>div{display:flex;align-items:baseline;gap:9px}
+.chart-dataset{font-size:15px;font-weight:800;letter-spacing:-.03em}
+.chart-card-head small,.chart-unit{font:8px var(--mono);color:#969bad}
+.chart-canvas-wrap{height:310px;position:relative}
+.chart-footnote{font-size:9px;line-height:1.7;color:#9298a8;margin:13px 3px 0}
+@media(max-width:900px){.charts-grid{grid-template-columns:1fr}.chart-canvas-wrap{height:330px}}
+@media(max-width:640px){.results-section .section{padding-top:70px;padding-bottom:72px}.results-panel{padding:17px 13px}.results-panel-heading h3,.curves-heading h3{font-size:18px}.results-panel-heading,.curves-heading{align-items:flex-start;flex-direction:column;gap:9px}.curves-heading{margin-top:36px}.chart-card{padding:15px 10px 10px}.chart-canvas-wrap{height:290px}.chart-card-head{padding:0 4px}.results-table{font-size:9px}}

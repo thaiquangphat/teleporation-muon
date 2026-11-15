@@ -7,7 +7,7 @@ load_wandb_config
 
 # Use the regular trainer for all experiments.
 run_for_seeds() {
-    for seed in 1; do
+    for seed in 1 2 3 4 5; do
         python3 src/vit/train.py --seed "$seed" "$@"
     done
 }
@@ -19,13 +19,13 @@ COMMON_ARGS=(
     --num_channels 3
     --num-classes 100
     --batch-size 256
-    --epochs 10
+    --epochs 30
     --d-model 192
     --intermediate-size 768
     --num-heads 3
     --position-embedding "rope"
     --opt "muon"
-    --lr 0.02
+    --lr 0.01
     --momentum 0.9
     --weight_decay 1e-5
 )
@@ -39,9 +39,9 @@ TELE_ARGS=(
     --tele-layer "all"
     --tele-batch 4
     --tele-cons 4
-    --tele-high 1.65
-    --tele-low 0.35
-    --tele-epoch-array 1
+    --tele-high 1.55
+    --tele-low 0.45
+    --tele-epoch-array 1,6
 )
 
 # CIFAR-100: plain Muon baseline (ordinary EMA).
