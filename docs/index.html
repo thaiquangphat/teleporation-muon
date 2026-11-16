@@ -1,322 +1,186 @@
 <!doctype html>
 <html lang="en">
-
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101322">
-  <meta name="description"
-    content="Muon Teleportation explores symmetry-preserving reparameterizations and optimizer-aware candidate search for Muon training in Vision Transformers and GPT-2.">
-  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#ffffff" id="theme-color-meta">
+  <meta name="description" content="Muon Teleportation: symmetry-aware candidate search for Muon optimization.">
   <meta property="og:title" content="Muon Teleportation">
-  <meta property="og:description"
-    content="Symmetry-aware candidate search for Muon optimization across vision and language models.">
+  <meta property="og:description" content="Symmetry-aware candidate search for Muon optimization across vision and language models.">
   <meta property="og:image" content="https://thaiquangphat.github.io/teleporation-muon/assets/teaser.svg">
-  <title>Muon Teleportation — Symmetry-aware search for Muon</title>
+  <title>Muon Teleportation</title>
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link
-    href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap"
-    rel="stylesheet">
-  <link rel="stylesheet" href="assets/styles.css?v=2">
+  <link rel="stylesheet" href="assets/styles.css?v=4">
 </head>
-
 <body>
-  <div class="page-noise" aria-hidden="true"></div>
-  <header class="site-header">
-    <a class="brand" href="#top" aria-label="Muon Teleportation home">
-      <span class="brand-mark">μ</span>
-      <span>MUON <b>TELEPORTATION</b></span>
-    </a>
-    <nav class="main-nav" aria-label="Main navigation">
-      <a href="#results">Results</a>
-      <a href="#experiments">Experiments</a>
-    </nav>
-    <a class="nav-code" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">
-      <span>Source code</span><span aria-hidden="true">↗</span>
-    </a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="site-name" href="#top"><span class="mu">μ</span> Muon Teleportation</a>
+      <nav aria-label="Page navigation"><a href="#method">Method</a><a href="#results">Results</a><a href="#experiments">Experiments</a></nav>
+      <div class="topbar-actions"><button class="theme-toggle" id="themeToggle" type="button" aria-label="Switch to dark mode" title="Switch theme"><span class="theme-icon" aria-hidden="true">☾</span><span class="theme-label">Dark</span></button><a class="github-link" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">GitHub <span>↗</span></a></div>
+    </div>
   </header>
-
-  <main id="top">
-    <section class="hero shell">
-      <div class="hero-copy">
-        <div class="eyebrow"><span class="eyebrow-dot"></span> OPTIMIZER-AWARE REPARAMETERIZATION</div>
-        <h1>Muon<br><span class="gradient-word">Teleportation</span></h1>
-        <p class="hero-lead">Exploring symmetry-preserving transformations as a search space for Muon optimization.</p>
-        <p class="hero-description">Can we move a model to an equivalent parameterization where Muon finds a more useful
-          update direction? This project investigates that question through candidate generation, optimizer-aware
-          scoring, and state transport.</p>
-        <div class="hero-actions">
-          <a class="button button-primary" href="https://github.com/thaiquangphat/teleporation-muon" target="_blank"
-            rel="noreferrer">Explore the code <span aria-hidden="true">↗</span></a>
-          <a class="button button-quiet" href="#idea">How it works <span aria-hidden="true">↓</span></a>
-        </div>
-        <div class="hero-tags" aria-label="Project areas">
-          <span>Vision Transformers</span><i></i><span>GPT-2</span><i></i><span>Muon</span>
-        </div>
-      </div>
-
-      <div class="hero-visual-wrap">
-        <div class="visual-kicker"><span>FIG. 01</span><span>SYMMETRY SEARCH</span></div>
-        <div class="hero-visual">
-          <div class="visual-topline"><span class="live-dot"></span> FUNCTION-PRESERVING SEARCH</div>
-          <div class="state-card state-source">
-            <span class="card-label">STARTING MODEL</span>
-            <div class="state-symbol">θ</div>
-            <span class="state-caption">Current parameters</span>
-          </div>
-          <div class="connector connector-a"><span>T</span></div>
-          <div class="candidate-area">
-            <div class="candidate-heading"><span>SYMMETRY CANDIDATES</span><span class="candidate-count">T₁ — Tₖ</span>
-            </div>
-            <div class="candidate-row">
-              <div class="candidate candidate-one"><span class="candidate-id">T₁</span><span
-                  class="candidate-bars"><i></i><i></i><i></i><i></i></span><span class="candidate-score">S₁</span>
-              </div>
-              <div class="candidate candidate-two"><span class="candidate-id">T₂</span><span
-                  class="candidate-bars"><i></i><i></i><i></i><i></i></span><span class="candidate-score">S₂</span>
-              </div>
-              <div class="candidate candidate-three"><span class="candidate-id">T₃</span><span
-                  class="candidate-bars"><i></i><i></i><i></i><i></i></span><span class="candidate-score">S₃</span>
-              </div>
-            </div>
-            <div class="score-line"><span></span><b>MUON-DIRECTION SCORING</b><span></span></div>
-            <div class="selection-card"><span class="selection-check">✓</span><span><small>SELECTED
-                  CANDIDATE</small><strong>T*</strong></span><span class="selection-arrow">↗</span></div>
-          </div>
-          <div class="visual-equation"><span>f<sub>θ′</sub>(x) = f<sub>θ</sub>(x)</span><small>equivalent function · new
-              coordinates</small></div>
-          <div class="visual-orbit orbit-one"></div>
-          <div class="visual-orbit orbit-two"></div>
-        </div>
-        <div class="visual-caption"><span class="caption-bar"></span> Search over equivalent parameterizations, then
-          transport the optimizer state.</div>
-      </div>
+  <main class="article" id="top">
+    <header class="article-header">
+      <p class="kicker">RESEARCH PROJECT · OPTIMIZATION</p>
+      <h1>Muon Teleportation</h1>
+      <p class="subtitle">Searching over equivalent parameterizations to find better update directions for Muon.</p>
+      <div class="byline"><span>Quang Phat Thai</span><span class="dot">·</span></div>
+    </header>
+    
+    <section id="method" class="article-section">
+      <h2>Method</h2>
+      <figure class="algorithm-figure">
+        <img src="assets/algo.png" alt="Muon Teleportation algorithm" loading="lazy">
+        <figcaption>Algorithm 1. Candidate search and teleportation procedure.</figcaption>
+      </figure>
     </section>
 
-    <section class="quick-facts shell" aria-label="Project summary">
-      <div class="fact"><span class="fact-label">CORE IDEA</span><strong>Function-preserving</strong><small>parameter
-          transformations</small></div>
-      <div class="fact"><span class="fact-label">SEARCH</span><strong>Candidate-based</strong><small>score and
-          select</small></div>
-      <div class="fact"><span class="fact-label">OPTIMIZER</span><strong>Muon</strong><small>with transported
-          momentum</small></div>
-      <div class="fact"><span class="fact-label">SETTINGS</span><strong>Vision + Language</strong><small>ViT and
-          GPT-2</small></div>
+    <section id="results" class="article-section">
+      <h2>Results</h2>
+      <p>Final accuracy and time per epoch are reported as mean ± standard deviation over five seeds. Speedup is the percentage of epochs saved to reach the baseline's final accuracy.</p>
+      <h3 class="subheading">Final performance</h3>
+      <div class="table-scroll" role="region" aria-label="Final performance table" tabindex="0">
+        <table>
+          <thead><tr><th rowspan="2">Dataset</th><th rowspan="2">Teleport</th><th colspan="3">APE</th><th colspan="3">RoPE</th></tr><tr><th>Accuracy ↑</th><th>Speedup ↑</th><th>Time/epoch ↓</th><th>Accuracy ↑</th><th>Speedup ↑</th><th>Time/epoch ↓</th></tr></thead>
+          <tbody>
+            <tr><th rowspan="2">CIFAR-10</th><td>No</td><td>79.82 ± 0.76</td><td>—</td><td>9.32 ± 0.13 s</td><td>82.15 ± 0.20</td><td>—</td><td>10.34 ± 0.11 s</td></tr>
+            <tr><td>Yes</td><td class="best">81.35 ± 0.39</td><td>14.00 ± 5.48</td><td>10.38 ± 0.18 s</td><td class="best">83.73 ± 0.29</td><td>18.00 ± 4.47</td><td>11.63 ± 0.12 s</td></tr>
+            <tr class="break-row"><th rowspan="2">CIFAR-100</th><td>No</td><td>55.73 ± 0.59</td><td>—</td><td>7.84 ± 0.49 s</td><td>59.25 ± 0.56</td><td>—</td><td>10.50 ± 0.22 s</td></tr>
+            <tr><td>Yes</td><td class="best">58.77 ± 0.51</td><td>51.33 ± 6.06</td><td>7.87 ± 0.17 s</td><td class="best">60.61 ± 0.67</td><td>32.00 ± 9.01</td><td>10.83 ± 0.08 s</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small-note">Best accuracy values within each dataset and positional encoding are highlighted.</p>
+
+      <h3 class="subheading chart-title">Training curves</h3>
+      <div class="dataset-picker" role="group" aria-label="Choose dataset for training curves">
+        <button class="dataset-option is-selected" type="button" data-dataset="0" aria-pressed="true"><span class="dataset-option-name">CIFAR-10</span><span class="dataset-option-meta">10 epochs</span></button>
+        <button class="dataset-option" type="button" data-dataset="1" aria-pressed="false"><span class="dataset-option-name">CIFAR-100</span><span class="dataset-option-meta">30 epochs</span></button>
+      </div>
+      <div class="chart-block">
+        <div class="chart-heading"><strong id="activeDatasetName">CIFAR-10</strong><span id="activeDatasetEpochs">10 epochs</span></div>
+        <div class="chart-wrap"><canvas id="trainingChart" role="img" aria-label="CIFAR-10 validation accuracy chart"></canvas></div>
+      </div>
+      <p class="small-note">Solid lines: teleportation. Dashed lines: no teleportation. Blue: RoPE. Orange: APE. Shaded regions show the min–max range across five seeds.</p>
     </section>
 
-    <section class="algorithm-section" id="algorithm">
-      <div class="algorithm-inner shell">
-        <div class="section-heading">
-          <div class="section-index">ALGORITHM</div>
-          <h2>Teleportation helps<br><span>generalization.</span></h2>
-        </div>
-
-        <figure class="algorithm-figure">
-          <img
-            class="algorithm-image"
-            src="assets/algo.png"
-            alt="Muon Teleportation algorithm"
-            loading="lazy"
-          >
-        </figure>
-      </div>
+    <section id="experiments" class="article-section">
+      <h2>Experiment settings</h2>
+      <h3 class="subheading">Vision Transformers</h3>
+      <p class="tag-row"><span>MNIST</span><span>CIFAR-10</span><span>CIFAR-100</span><span>ImageNet-1K</span></p>
+      <p><a class="inline-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/vit" target="_blank" rel="noreferrer">ViT implementation ↗</a></p>
+      <h3 class="subheading">Large Language Models</h3>
+      <p class="tag-row"><span>WikiText-103</span></p>
+      <p><a class="inline-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/lm" target="_blank" rel="noreferrer">Language-model implementation ↗</a></p>
     </section>
 
-
-    <section class="results-section" id="results">
-      <div class="section shell">
-        <div class="section-heading">
-          <div class="section-index">RESULTS</div>
-          <h2>Teleportation improves<br><span>validation performance.</span></h2>
-          <p class="results-intro">Accuracy and time/epoch are reported as mean ± standard deviation over five seeds.
-            Speedup is the percentage of epochs saved to reach the baseline's final accuracy.</p>
-        </div>
-        <div class="results-panel">
-          <div class="results-panel-heading">
-            <div><span class="panel-kicker">TABLE 01</span>
-              <h3>Final performance</h3>
-            </div><span class="panel-note">5 random seeds</span>
-          </div>
-
-          <div class="results-table-wrap">
-            <table class="results-table">
-              <thead>
-                <tr>
-                  <th rowspan="2">Dataset</th>
-                  <th rowspan="2">Teleport</th>
-                  <th colspan="3">APE</th>
-                  <th colspan="3">RoPE</th>
-                </tr>
-                <tr>
-                  <th>Accuracy (%) ↑</th>
-                  <th>Speedup (%) ↑</th>
-                  <th>Time/epoch ↓</th>
-                  <th>Accuracy (%) ↑</th>
-                  <th>Speedup (%) ↑</th>
-                  <th>Time/epoch ↓</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <th rowspan="2">CIFAR-10</th>
-                  <td>No</td>
-                  <td>79.82 ± 0.76</td>
-                  <td>—</td>
-                  <td>9.32 ± 0.13 s</td>
-                  <td>82.15 ± 0.20</td>
-                  <td>—</td>
-                  <td>10.34 ± 0.11 s</td>
-                </tr>
-                <tr>
-                  <td>Yes</td>
-                  <td class="best">81.35 ± 0.39</td>
-                  <td>14.00 ± 5.48</td>
-                  <td>10.38 ± 0.18 s</td>
-                  <td class="best">83.73 ± 0.29</td>
-                  <td>18.00 ± 4.47</td>
-                  <td>11.63 ± 0.12 s</td>
-                </tr>
-                <tr class="dataset-break">
-                  <th rowspan="2">CIFAR-100</th>
-                  <td>No</td>
-                  <td>55.73 ± 0.59</td>
-                  <td>—</td>
-                  <td>7.84 ± 0.49 s</td>
-                  <td>59.25 ± 0.56</td>
-                  <td>—</td>
-                  <td>10.50 ± 0.22 s</td>
-                </tr>
-                <tr>
-                  <td>Yes</td>
-                  <td class="best">58.77 ± 0.51</td>
-                  <td>51.33 ± 6.06</td>
-                  <td>7.87 ± 0.17 s</td>
-                  <td class="best">60.61 ± 0.67</td>
-                  <td>32.00 ± 9.01</td>
-                  <td>10.83 ± 0.08 s</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <div class="curves-heading">
-          <div><span class="panel-kicker">FIGURE 01</span>
-            <h3>Validation accuracy by epoch</h3>
-            <p>Hover over a curve to inspect its value at each epoch. Click a legend item to show or hide a run.</p>
-          </div>
-          <span class="band-key"><i></i> Min–max across 5 seeds</span>
-        </div>
-        <div class="charts-grid">
-          <article class="chart-card">
-            <div class="chart-card-head">
-              <div><span class="chart-dataset">CIFAR-10</span><small>10 epochs</small></div><span
-                class="chart-unit">Accuracy (%)</span>
-            </div>
-            <div class="chart-canvas-wrap"><canvas id="cifar10Chart" role="img"
-                aria-label="CIFAR-10 validation accuracy chart"></canvas></div>
-          </article>
-          <article class="chart-card">
-            <div class="chart-card-head">
-              <div><span class="chart-dataset">CIFAR-100</span><small>30 epochs</small></div><span
-                class="chart-unit">Accuracy (%)</span>
-            </div>
-            <div class="chart-canvas-wrap"><canvas id="cifar100Chart" role="img"
-                aria-label="CIFAR-100 validation accuracy chart"></canvas></div>
-          </article>
-        </div>
-        <p class="chart-footnote">Lines show the mean over five seeds; shaded bands show the min–max range across seeds.
-          Dashed lines denote no teleportation; solid lines denote teleportation.</p>
-      </div>
-    </section>
-
-    <section class="section shell" id="experiments">
-      <div class="section-heading">
-        <div class="section-index">EXPERIMENTS</div>
-        <h2>Two model families.<br><span>One research question.</span></h2>
-      </div>
-      <div class="tracks-grid">
-        <article class="track-card track-vit">
-          <div class="track-art art-vit" aria-hidden="true">
-            <div class="patch-grid"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="art-label">VISION / 01</div>
-          </div>
-          <div class="track-content">
-            <div class="track-meta">IMAGE CLASSIFICATION</div>
-            <h3>Vision Transformers</h3>
-            <p>Study symmetry-based teleportation in ViT attention and MLP components, including RoPE-aware attention
-              transformations.</p>
-            <div class="dataset-list">
-              <span>MNIST</span><span>CIFAR-10</span><span>CIFAR-100</span><span>ImageNet-1K</span></div><a
-              class="text-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/vit"
-              target="_blank" rel="noreferrer">Explore ViT implementation <b>↗</b></a>
-          </div>
-        </article>
-        <article class="track-card track-lm">
-          <div class="track-art art-lm" aria-hidden="true">
-            <div class="token-flow"><span>the</span><span>model</span><span>learns</span><span>...</span></div>
-            <div class="art-wave"></div>
-            <div class="art-label">LANGUAGE / 02</div>
-          </div>
-          <div class="track-content">
-            <div class="track-meta">NEXT-TOKEN PREDICTION</div>
-            <h3>GPT-2 Language Modeling</h3>
-            <p>Extend the candidate search to GPT-2, with symmetry transformations for fused QKV attention projections
-              and MLP layers.</p>
-            <div class="dataset-list"><span>GPT-2</span><span>WikiText-103</span><span>Muon + AdamW</span></div><a
-              class="text-link" href="https://github.com/thaiquangphat/teleporation-muon/tree/main/src/lm"
-              target="_blank" rel="noreferrer">Explore LM implementation <b>↗</b></a>
-          </div>
-        </article>
-      </div>
-    </section>
+    <hr class="end-rule">
+    <footer class="article-footer"><span>Muon Teleportation</span><a href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">Source code on GitHub ↗</a></footer>
   </main>
-
-  <footer class="site-footer shell">
-    <a class="brand footer-brand" href="#top"><span class="brand-mark">μ</span><span>MUON
-        <b>TELEPORTATION</b></span></a>
-    <span class="footer-caption">An experimental codebase for symmetry-aware Muon optimization.</span>
-    <a href="https://github.com/thaiquangphat/teleporation-muon" target="_blank" rel="noreferrer">GitHub ↗</a>
-  </footer>
-
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
   <script>
-    // Mean curves and min–max bands are transcribed from curve.txt.
-    const curveData = [[{ "label": "RoPE, teleport", "upper": [{ "x": 1.0, "y": 58.98 }, { "x": 2.0, "y": 67.82 }, { "x": 3.0, "y": 71.4 }, { "x": 4.0, "y": 75.16 }, { "x": 5.0, "y": 78.21 }, { "x": 6.0, "y": 80.02 }, { "x": 7.0, "y": 81.33 }, { "x": 8.0, "y": 82.8 }, { "x": 9.0, "y": 83.71 }, { "x": 10.0, "y": 84.12 }], "lower": [{ "x": 1.0, "y": 57.05 }, { "x": 2.0, "y": 65.51 }, { "x": 3.0, "y": 69.37 }, { "x": 4.0, "y": 72.41 }, { "x": 5.0, "y": 75.54 }, { "x": 6.0, "y": 77.87 }, { "x": 7.0, "y": 79.91 }, { "x": 8.0, "y": 81.88 }, { "x": 9.0, "y": 83.12 }, { "x": 10.0, "y": 83.34 }], "mean": [{ "x": 1.0, "y": 58.274 }, { "x": 2.0, "y": 66.314 }, { "x": 3.0, "y": 70.38 }, { "x": 4.0, "y": 73.966 }, { "x": 5.0, "y": 77.268 }, { "x": 6.0, "y": 79.23 }, { "x": 7.0, "y": 80.826 }, { "x": 8.0, "y": 82.426 }, { "x": 9.0, "y": 83.416 }, { "x": 10.0, "y": 83.732 }] }, { "label": "RoPE, no teleport", "upper": [{ "x": 1.0, "y": 55.93 }, { "x": 2.0, "y": 64.7 }, { "x": 3.0, "y": 69.36 }, { "x": 4.0, "y": 72.75 }, { "x": 5.0, "y": 76.27 }, { "x": 6.0, "y": 78.03 }, { "x": 7.0, "y": 79.73 }, { "x": 8.0, "y": 81.43 }, { "x": 9.0, "y": 82.27 }, { "x": 10.0, "y": 82.39 }], "lower": [{ "x": 1.0, "y": 53.5 }, { "x": 2.0, "y": 62.6 }, { "x": 3.0, "y": 66.38 }, { "x": 4.0, "y": 70.34 }, { "x": 5.0, "y": 74.77 }, { "x": 6.0, "y": 76.5 }, { "x": 7.0, "y": 79.21 }, { "x": 8.0, "y": 80.52 }, { "x": 9.0, "y": 81.51 }, { "x": 10.0, "y": 81.86 }], "mean": [{ "x": 1.0, "y": 55.008 }, { "x": 2.0, "y": 63.358 }, { "x": 3.0, "y": 68.206 }, { "x": 4.0, "y": 71.362 }, { "x": 5.0, "y": 75.408 }, { "x": 6.0, "y": 77.384 }, { "x": 7.0, "y": 79.428 }, { "x": 8.0, "y": 80.89 }, { "x": 9.0, "y": 81.894 }, { "x": 10.0, "y": 82.154 }] }, { "label": "APE, teleport", "upper": [{ "x": 1.0, "y": 55.31 }, { "x": 2.0, "y": 61.62 }, { "x": 3.0, "y": 67.43 }, { "x": 4.0, "y": 70.84 }, { "x": 5.0, "y": 74.68 }, { "x": 6.0, "y": 76.66 }, { "x": 7.0, "y": 78.6 }, { "x": 8.0, "y": 80.2 }, { "x": 9.0, "y": 81.65 }, { "x": 10.0, "y": 81.82 }], "lower": [{ "x": 1.0, "y": 53.27 }, { "x": 2.0, "y": 59.71 }, { "x": 3.0, "y": 65.43 }, { "x": 4.0, "y": 69.21 }, { "x": 5.0, "y": 73.26 }, { "x": 6.0, "y": 75.04 }, { "x": 7.0, "y": 77.2 }, { "x": 8.0, "y": 79.45 }, { "x": 9.0, "y": 80.35 }, { "x": 10.0, "y": 80.78 }], "mean": [{ "x": 1.0, "y": 54.626 }, { "x": 2.0, "y": 60.7 }, { "x": 3.0, "y": 66.728 }, { "x": 4.0, "y": 69.796 }, { "x": 5.0, "y": 74.084 }, { "x": 6.0, "y": 75.684 }, { "x": 7.0, "y": 77.964 }, { "x": 8.0, "y": 79.694 }, { "x": 9.0, "y": 81.028 }, { "x": 10.0, "y": 81.35 }] }, { "label": "APE, no teleport", "upper": [{ "x": 1.0, "y": 50.84 }, { "x": 2.0, "y": 59.37 }, { "x": 3.0, "y": 64.15 }, { "x": 4.0, "y": 68.55 }, { "x": 5.0, "y": 71.43 }, { "x": 6.0, "y": 75.21 }, { "x": 7.0, "y": 76.94 }, { "x": 8.0, "y": 79.41 }, { "x": 9.0, "y": 80.38 }, { "x": 10.0, "y": 80.91 }], "lower": [{ "x": 1.0, "y": 49.25 }, { "x": 2.0, "y": 57.3 }, { "x": 3.0, "y": 61.98 }, { "x": 4.0, "y": 65.05 }, { "x": 5.0, "y": 70.2 }, { "x": 6.0, "y": 71.21 }, { "x": 7.0, "y": 75.24 }, { "x": 8.0, "y": 77.23 }, { "x": 9.0, "y": 78.45 }, { "x": 10.0, "y": 79.08 }], "mean": [{ "x": 1.0, "y": 50.118 }, { "x": 2.0, "y": 58.21 }, { "x": 3.0, "y": 62.762 }, { "x": 4.0, "y": 66.966 }, { "x": 5.0, "y": 70.962 }, { "x": 6.0, "y": 73.33 }, { "x": 7.0, "y": 76.066 }, { "x": 8.0, "y": 78.122 }, { "x": 9.0, "y": 79.312 }, { "x": 10.0, "y": 79.822 }] }], [{ "label": "RoPE, teleport", "upper": [{ "x": 1.0, "y": 25.37 }, { "x": 2.0, "y": 37.31 }, { "x": 3.0, "y": 42.93 }, { "x": 4.0, "y": 46.46 }, { "x": 5.0, "y": 49.96 }, { "x": 6.0, "y": 51.01 }, { "x": 7.0, "y": 52.89 }, { "x": 8.0, "y": 54.39 }, { "x": 9.0, "y": 56.14 }, { "x": 10.0, "y": 56.73 }, { "x": 11.0, "y": 57.61 }, { "x": 12.0, "y": 57.08 }, { "x": 13.0, "y": 58.24 }, { "x": 14.0, "y": 58.34 }, { "x": 15.0, "y": 58.37 }, { "x": 16.0, "y": 58.55 }, { "x": 17.0, "y": 59.01 }, { "x": 18.0, "y": 59.06 }, { "x": 19.0, "y": 58.85 }, { "x": 20.0, "y": 59.65 }, { "x": 21.0, "y": 59.65 }, { "x": 22.0, "y": 60.29 }, { "x": 23.0, "y": 60.02 }, { "x": 24.0, "y": 60.34 }, { "x": 25.0, "y": 61.16 }, { "x": 26.0, "y": 61.33 }, { "x": 27.0, "y": 61.35 }, { "x": 28.0, "y": 61.52 }, { "x": 29.0, "y": 61.55 }, { "x": 30.0, "y": 61.65 }], "lower": [{ "x": 1.0, "y": 23.02 }, { "x": 2.0, "y": 34.24 }, { "x": 3.0, "y": 41.62 }, { "x": 4.0, "y": 45.18 }, { "x": 5.0, "y": 47.35 }, { "x": 6.0, "y": 50.09 }, { "x": 7.0, "y": 51.99 }, { "x": 8.0, "y": 52.9 }, { "x": 9.0, "y": 53.66 }, { "x": 10.0, "y": 54.61 }, { "x": 11.0, "y": 56.22 }, { "x": 12.0, "y": 55.85 }, { "x": 13.0, "y": 56.71 }, { "x": 14.0, "y": 57.05 }, { "x": 15.0, "y": 57.36 }, { "x": 16.0, "y": 57.78 }, { "x": 17.0, "y": 57.4 }, { "x": 18.0, "y": 57.83 }, { "x": 19.0, "y": 58.4 }, { "x": 20.0, "y": 58.13 }, { "x": 21.0, "y": 58.37 }, { "x": 22.0, "y": 58.59 }, { "x": 23.0, "y": 58.99 }, { "x": 24.0, "y": 59.01 }, { "x": 25.0, "y": 59.34 }, { "x": 26.0, "y": 59.27 }, { "x": 27.0, "y": 59.86 }, { "x": 28.0, "y": 59.91 }, { "x": 29.0, "y": 59.88 }, { "x": 30.0, "y": 60.12 }], "mean": [{ "x": 1.0, "y": 24.086 }, { "x": 2.0, "y": 35.448 }, { "x": 3.0, "y": 42.356 }, { "x": 4.0, "y": 45.764 }, { "x": 5.0, "y": 48.862 }, { "x": 6.0, "y": 50.642 }, { "x": 7.0, "y": 52.438 }, { "x": 8.0, "y": 53.836 }, { "x": 9.0, "y": 54.724 }, { "x": 10.0, "y": 55.858 }, { "x": 11.0, "y": 56.612 }, { "x": 12.0, "y": 56.698 }, { "x": 13.0, "y": 57.564 }, { "x": 14.0, "y": 57.594 }, { "x": 15.0, "y": 58.04 }, { "x": 16.0, "y": 57.998 }, { "x": 17.0, "y": 58.462 }, { "x": 18.0, "y": 58.518 }, { "x": 19.0, "y": 58.68 }, { "x": 20.0, "y": 58.788 }, { "x": 21.0, "y": 58.914 }, { "x": 22.0, "y": 59.31 }, { "x": 23.0, "y": 59.534 }, { "x": 24.0, "y": 59.68 }, { "x": 25.0, "y": 60.188 }, { "x": 26.0, "y": 60.164 }, { "x": 27.0, "y": 60.418 }, { "x": 28.0, "y": 60.58 }, { "x": 29.0, "y": 60.55 }, { "x": 30.0, "y": 60.612 }] }, { "label": "RoPE, no teleport", "upper": [{ "x": 1.0, "y": 22.17 }, { "x": 2.0, "y": 33.23 }, { "x": 3.0, "y": 39.47 }, { "x": 4.0, "y": 45.14 }, { "x": 5.0, "y": 46.29 }, { "x": 6.0, "y": 49.96 }, { "x": 7.0, "y": 51.15 }, { "x": 8.0, "y": 53.07 }, { "x": 9.0, "y": 53.99 }, { "x": 10.0, "y": 54.9 }, { "x": 11.0, "y": 55.96 }, { "x": 12.0, "y": 56.5 }, { "x": 13.0, "y": 57.88 }, { "x": 14.0, "y": 57.57 }, { "x": 15.0, "y": 57.82 }, { "x": 16.0, "y": 57.49 }, { "x": 17.0, "y": 58.0 }, { "x": 18.0, "y": 57.9 }, { "x": 19.0, "y": 58.01 }, { "x": 20.0, "y": 58.2 }, { "x": 21.0, "y": 58.41 }, { "x": 22.0, "y": 59.1 }, { "x": 23.0, "y": 58.77 }, { "x": 24.0, "y": 59.08 }, { "x": 25.0, "y": 59.3 }, { "x": 26.0, "y": 59.91 }, { "x": 27.0, "y": 59.67 }, { "x": 28.0, "y": 60.02 }, { "x": 29.0, "y": 60.21 }, { "x": 30.0, "y": 60.09 }], "lower": [{ "x": 1.0, "y": 20.78 }, { "x": 2.0, "y": 31.22 }, { "x": 3.0, "y": 38.32 }, { "x": 4.0, "y": 40.89 }, { "x": 5.0, "y": 45.32 }, { "x": 6.0, "y": 48.53 }, { "x": 7.0, "y": 49.57 }, { "x": 8.0, "y": 51.64 }, { "x": 9.0, "y": 52.8 }, { "x": 10.0, "y": 53.73 }, { "x": 11.0, "y": 54.37 }, { "x": 12.0, "y": 55.13 }, { "x": 13.0, "y": 55.77 }, { "x": 14.0, "y": 55.82 }, { "x": 15.0, "y": 56.04 }, { "x": 16.0, "y": 56.66 }, { "x": 17.0, "y": 57.07 }, { "x": 18.0, "y": 56.6 }, { "x": 19.0, "y": 56.65 }, { "x": 20.0, "y": 57.25 }, { "x": 21.0, "y": 57.35 }, { "x": 22.0, "y": 57.71 }, { "x": 23.0, "y": 57.85 }, { "x": 24.0, "y": 58.05 }, { "x": 25.0, "y": 58.31 }, { "x": 26.0, "y": 58.26 }, { "x": 27.0, "y": 58.46 }, { "x": 28.0, "y": 58.58 }, { "x": 29.0, "y": 58.84 }, { "x": 30.0, "y": 58.81 }], "mean": [{ "x": 1.0, "y": 21.244 }, { "x": 2.0, "y": 32.152 }, { "x": 3.0, "y": 38.86 }, { "x": 4.0, "y": 43.05 }, { "x": 5.0, "y": 45.902 }, { "x": 6.0, "y": 48.908 }, { "x": 7.0, "y": 50.478 }, { "x": 8.0, "y": 52.36 }, { "x": 9.0, "y": 53.502 }, { "x": 10.0, "y": 54.502 }, { "x": 11.0, "y": 55.022 }, { "x": 12.0, "y": 55.904 }, { "x": 13.0, "y": 56.396 }, { "x": 14.0, "y": 56.734 }, { "x": 15.0, "y": 56.792 }, { "x": 16.0, "y": 57.068 }, { "x": 17.0, "y": 57.534 }, { "x": 18.0, "y": 57.316 }, { "x": 19.0, "y": 57.396 }, { "x": 20.0, "y": 57.83 }, { "x": 21.0, "y": 58.108 }, { "x": 22.0, "y": 58.32 }, { "x": 23.0, "y": 58.394 }, { "x": 24.0, "y": 58.492 }, { "x": 25.0, "y": 58.79 }, { "x": 26.0, "y": 58.882 }, { "x": 27.0, "y": 58.964 }, { "x": 28.0, "y": 59.112 }, { "x": 29.0, "y": 59.28 }, { "x": 30.0, "y": 59.246 }] }, { "label": "APE, teleport", "upper": [{ "x": 1.0, "y": 23.79 }, { "x": 2.0, "y": 31.99 }, { "x": 3.0, "y": 38.77 }, { "x": 4.0, "y": 43.13 }, { "x": 5.0, "y": 47.28 }, { "x": 6.0, "y": 48.16 }, { "x": 7.0, "y": 50.9 }, { "x": 8.0, "y": 51.97 }, { "x": 9.0, "y": 53.1 }, { "x": 10.0, "y": 54.19 }, { "x": 11.0, "y": 55.56 }, { "x": 12.0, "y": 55.33 }, { "x": 13.0, "y": 56.09 }, { "x": 14.0, "y": 56.38 }, { "x": 15.0, "y": 56.71 }, { "x": 16.0, "y": 56.29 }, { "x": 17.0, "y": 57.57 }, { "x": 18.0, "y": 56.67 }, { "x": 19.0, "y": 57.59 }, { "x": 20.0, "y": 57.55 }, { "x": 21.0, "y": 57.69 }, { "x": 22.0, "y": 57.52 }, { "x": 23.0, "y": 58.36 }, { "x": 24.0, "y": 58.56 }, { "x": 25.0, "y": 58.65 }, { "x": 26.0, "y": 58.99 }, { "x": 27.0, "y": 59.04 }, { "x": 28.0, "y": 59.43 }, { "x": 29.0, "y": 59.58 }, { "x": 30.0, "y": 59.67 }], "lower": [{ "x": 1.0, "y": 20.49 }, { "x": 2.0, "y": 30.74 }, { "x": 3.0, "y": 37.36 }, { "x": 4.0, "y": 41.91 }, { "x": 5.0, "y": 45.33 }, { "x": 6.0, "y": 46.95 }, { "x": 7.0, "y": 48.48 }, { "x": 8.0, "y": 50.27 }, { "x": 9.0, "y": 51.9 }, { "x": 10.0, "y": 53.11 }, { "x": 11.0, "y": 54.37 }, { "x": 12.0, "y": 54.31 }, { "x": 13.0, "y": 54.81 }, { "x": 14.0, "y": 55.01 }, { "x": 15.0, "y": 55.71 }, { "x": 16.0, "y": 55.85 }, { "x": 17.0, "y": 55.92 }, { "x": 18.0, "y": 55.84 }, { "x": 19.0, "y": 55.97 }, { "x": 20.0, "y": 56.02 }, { "x": 21.0, "y": 57.09 }, { "x": 22.0, "y": 56.88 }, { "x": 23.0, "y": 57.4 }, { "x": 24.0, "y": 57.24 }, { "x": 25.0, "y": 57.74 }, { "x": 26.0, "y": 57.85 }, { "x": 27.0, "y": 58.06 }, { "x": 28.0, "y": 58.25 }, { "x": 29.0, "y": 58.49 }, { "x": 30.0, "y": 58.41 }], "mean": [{ "x": 1.0, "y": 22.658 }, { "x": 2.0, "y": 31.38 }, { "x": 3.0, "y": 38.298 }, { "x": 4.0, "y": 42.662 }, { "x": 5.0, "y": 46.026 }, { "x": 6.0, "y": 47.648 }, { "x": 7.0, "y": 49.59 }, { "x": 8.0, "y": 51.184 }, { "x": 9.0, "y": 52.58 }, { "x": 10.0, "y": 53.536 }, { "x": 11.0, "y": 54.806 }, { "x": 12.0, "y": 54.748 }, { "x": 13.0, "y": 55.362 }, { "x": 14.0, "y": 55.838 }, { "x": 15.0, "y": 56.274 }, { "x": 16.0, "y": 56.076 }, { "x": 17.0, "y": 56.668 }, { "x": 18.0, "y": 56.408 }, { "x": 19.0, "y": 56.75 }, { "x": 20.0, "y": 56.666 }, { "x": 21.0, "y": 57.402 }, { "x": 22.0, "y": 57.24 }, { "x": 23.0, "y": 57.682 }, { "x": 24.0, "y": 57.952 }, { "x": 25.0, "y": 58.088 }, { "x": 26.0, "y": 58.29 }, { "x": 27.0, "y": 58.468 }, { "x": 28.0, "y": 58.75 }, { "x": 29.0, "y": 58.77 }, { "x": 30.0, "y": 58.774 }] }, { "label": "APE, no teleport", "upper": [{ "x": 1.0, "y": 20.65 }, { "x": 2.0, "y": 27.59 }, { "x": 3.0, "y": 32.29 }, { "x": 4.0, "y": 36.69 }, { "x": 5.0, "y": 41.3 }, { "x": 6.0, "y": 43.81 }, { "x": 7.0, "y": 45.79 }, { "x": 8.0, "y": 48.13 }, { "x": 9.0, "y": 49.19 }, { "x": 10.0, "y": 50.54 }, { "x": 11.0, "y": 51.9 }, { "x": 12.0, "y": 52.9 }, { "x": 13.0, "y": 53.31 }, { "x": 14.0, "y": 53.63 }, { "x": 15.0, "y": 54.24 }, { "x": 16.0, "y": 53.59 }, { "x": 17.0, "y": 54.83 }, { "x": 18.0, "y": 54.71 }, { "x": 19.0, "y": 54.83 }, { "x": 20.0, "y": 54.88 }, { "x": 21.0, "y": 54.76 }, { "x": 22.0, "y": 55.37 }, { "x": 23.0, "y": 55.65 }, { "x": 24.0, "y": 55.9 }, { "x": 25.0, "y": 55.81 }, { "x": 26.0, "y": 56.12 }, { "x": 27.0, "y": 56.04 }, { "x": 28.0, "y": 56.47 }, { "x": 29.0, "y": 56.62 }, { "x": 30.0, "y": 56.37 }], "lower": [{ "x": 1.0, "y": 18.66 }, { "x": 2.0, "y": 24.63 }, { "x": 3.0, "y": 30.74 }, { "x": 4.0, "y": 35.53 }, { "x": 5.0, "y": 38.46 }, { "x": 6.0, "y": 42.08 }, { "x": 7.0, "y": 44.56 }, { "x": 8.0, "y": 46.29 }, { "x": 9.0, "y": 47.65 }, { "x": 10.0, "y": 49.44 }, { "x": 11.0, "y": 50.51 }, { "x": 12.0, "y": 51.51 }, { "x": 13.0, "y": 52.34 }, { "x": 14.0, "y": 52.47 }, { "x": 15.0, "y": 53.18 }, { "x": 16.0, "y": 52.56 }, { "x": 17.0, "y": 53.56 }, { "x": 18.0, "y": 53.13 }, { "x": 19.0, "y": 53.81 }, { "x": 20.0, "y": 53.93 }, { "x": 21.0, "y": 53.99 }, { "x": 22.0, "y": 53.5 }, { "x": 23.0, "y": 54.29 }, { "x": 24.0, "y": 54.49 }, { "x": 25.0, "y": 54.78 }, { "x": 26.0, "y": 55.06 }, { "x": 27.0, "y": 54.86 }, { "x": 28.0, "y": 54.91 }, { "x": 29.0, "y": 54.92 }, { "x": 30.0, "y": 54.95 }], "mean": [{ "x": 1.0, "y": 19.326 }, { "x": 2.0, "y": 25.944 }, { "x": 3.0, "y": 31.394 }, { "x": 4.0, "y": 36.252 }, { "x": 5.0, "y": 39.92 }, { "x": 6.0, "y": 42.998 }, { "x": 7.0, "y": 45.176 }, { "x": 8.0, "y": 46.962 }, { "x": 9.0, "y": 48.618 }, { "x": 10.0, "y": 49.978 }, { "x": 11.0, "y": 51.242 }, { "x": 12.0, "y": 52.146 }, { "x": 13.0, "y": 52.776 }, { "x": 14.0, "y": 53.078 }, { "x": 15.0, "y": 53.52 }, { "x": 16.0, "y": 53.24 }, { "x": 17.0, "y": 54.16 }, { "x": 18.0, "y": 54.076 }, { "x": 19.0, "y": 54.322 }, { "x": 20.0, "y": 54.384 }, { "x": 21.0, "y": 54.474 }, { "x": 22.0, "y": 54.666 }, { "x": 23.0, "y": 54.916 }, { "x": 24.0, "y": 55.292 }, { "x": 25.0, "y": 55.314 }, { "x": 26.0, "y": 55.496 }, { "x": 27.0, "y": 55.394 }, { "x": 28.0, "y": 55.63 }, { "x": 29.0, "y": 55.8 }, { "x": 30.0, "y": 55.734 }] }]];
+    // Theme preference: saved locally; otherwise follow the operating-system preference.
+    (() => {
+      const root = document.documentElement;
+      const button = document.getElementById("themeToggle");
+      const meta = document.getElementById("theme-color-meta");
+      const getPreferred = () => {
+        try { return localStorage.getItem("muon-theme"); } catch (_) { return null; }
+      };
+      const applyTheme = (theme) => {
+        root.dataset.theme = theme;
+        const dark = theme === "dark";
+        button.setAttribute("aria-label", dark ? "Switch to light mode" : "Switch to dark mode");
+        button.innerHTML = dark
+          ? '<span class="theme-icon" aria-hidden="true">☀</span><span class="theme-label">Light</span>'
+          : '<span class="theme-icon" aria-hidden="true">☾</span><span class="theme-label">Dark</span>';
+        meta.setAttribute("content", dark ? "#101a2a" : "#ffffff");
+        if (typeof updateChartTheme === "function") updateChartTheme(dark);
+      };
+      const saved = getPreferred();
+      const systemDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      applyTheme(saved || (systemDark ? "dark" : "light"));
+      button.addEventListener("click", () => {
+        const next = root.dataset.theme === "dark" ? "light" : "dark";
+        applyTheme(next);
+        try { localStorage.setItem("muon-theme", next); } catch (_) {}
+      });
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+
+  <script>
+    // Five-seed means and min–max bands from the experiment curves.
+const curveData = [[{ "label": "RoPE, teleport", "upper": [{ "x": 1.0, "y": 58.98 }, { "x": 2.0, "y": 67.82 }, { "x": 3.0, "y": 71.4 }, { "x": 4.0, "y": 75.16 }, { "x": 5.0, "y": 78.21 }, { "x": 6.0, "y": 80.02 }, { "x": 7.0, "y": 81.33 }, { "x": 8.0, "y": 82.8 }, { "x": 9.0, "y": 83.71 }, { "x": 10.0, "y": 84.12 }], "lower": [{ "x": 1.0, "y": 57.05 }, { "x": 2.0, "y": 65.51 }, { "x": 3.0, "y": 69.37 }, { "x": 4.0, "y": 72.41 }, { "x": 5.0, "y": 75.54 }, { "x": 6.0, "y": 77.87 }, { "x": 7.0, "y": 79.91 }, { "x": 8.0, "y": 81.88 }, { "x": 9.0, "y": 83.12 }, { "x": 10.0, "y": 83.34 }], "mean": [{ "x": 1.0, "y": 58.274 }, { "x": 2.0, "y": 66.314 }, { "x": 3.0, "y": 70.38 }, { "x": 4.0, "y": 73.966 }, { "x": 5.0, "y": 77.268 }, { "x": 6.0, "y": 79.23 }, { "x": 7.0, "y": 80.826 }, { "x": 8.0, "y": 82.426 }, { "x": 9.0, "y": 83.416 }, { "x": 10.0, "y": 83.732 }] }, { "label": "RoPE, no teleport", "upper": [{ "x": 1.0, "y": 55.93 }, { "x": 2.0, "y": 64.7 }, { "x": 3.0, "y": 69.36 }, { "x": 4.0, "y": 72.75 }, { "x": 5.0, "y": 76.27 }, { "x": 6.0, "y": 78.03 }, { "x": 7.0, "y": 79.73 }, { "x": 8.0, "y": 81.43 }, { "x": 9.0, "y": 82.27 }, { "x": 10.0, "y": 82.39 }], "lower": [{ "x": 1.0, "y": 53.5 }, { "x": 2.0, "y": 62.6 }, { "x": 3.0, "y": 66.38 }, { "x": 4.0, "y": 70.34 }, { "x": 5.0, "y": 74.77 }, { "x": 6.0, "y": 76.5 }, { "x": 7.0, "y": 79.21 }, { "x": 8.0, "y": 80.52 }, { "x": 9.0, "y": 81.51 }, { "x": 10.0, "y": 81.86 }], "mean": [{ "x": 1.0, "y": 55.008 }, { "x": 2.0, "y": 63.358 }, { "x": 3.0, "y": 68.206 }, { "x": 4.0, "y": 71.362 }, { "x": 5.0, "y": 75.408 }, { "x": 6.0, "y": 77.384 }, { "x": 7.0, "y": 79.428 }, { "x": 8.0, "y": 80.89 }, { "x": 9.0, "y": 81.894 }, { "x": 10.0, "y": 82.154 }] }, { "label": "APE, teleport", "upper": [{ "x": 1.0, "y": 55.31 }, { "x": 2.0, "y": 61.62 }, { "x": 3.0, "y": 67.43 }, { "x": 4.0, "y": 70.84 }, { "x": 5.0, "y": 74.68 }, { "x": 6.0, "y": 76.66 }, { "x": 7.0, "y": 78.6 }, { "x": 8.0, "y": 80.2 }, { "x": 9.0, "y": 81.65 }, { "x": 10.0, "y": 81.82 }], "lower": [{ "x": 1.0, "y": 53.27 }, { "x": 2.0, "y": 59.71 }, { "x": 3.0, "y": 65.43 }, { "x": 4.0, "y": 69.21 }, { "x": 5.0, "y": 73.26 }, { "x": 6.0, "y": 75.04 }, { "x": 7.0, "y": 77.2 }, { "x": 8.0, "y": 79.45 }, { "x": 9.0, "y": 80.35 }, { "x": 10.0, "y": 80.78 }], "mean": [{ "x": 1.0, "y": 54.626 }, { "x": 2.0, "y": 60.7 }, { "x": 3.0, "y": 66.728 }, { "x": 4.0, "y": 69.796 }, { "x": 5.0, "y": 74.084 }, { "x": 6.0, "y": 75.684 }, { "x": 7.0, "y": 77.964 }, { "x": 8.0, "y": 79.694 }, { "x": 9.0, "y": 81.028 }, { "x": 10.0, "y": 81.35 }] }, { "label": "APE, no teleport", "upper": [{ "x": 1.0, "y": 50.84 }, { "x": 2.0, "y": 59.37 }, { "x": 3.0, "y": 64.15 }, { "x": 4.0, "y": 68.55 }, { "x": 5.0, "y": 71.43 }, { "x": 6.0, "y": 75.21 }, { "x": 7.0, "y": 76.94 }, { "x": 8.0, "y": 79.41 }, { "x": 9.0, "y": 80.38 }, { "x": 10.0, "y": 80.91 }], "lower": [{ "x": 1.0, "y": 49.25 }, { "x": 2.0, "y": 57.3 }, { "x": 3.0, "y": 61.98 }, { "x": 4.0, "y": 65.05 }, { "x": 5.0, "y": 70.2 }, { "x": 6.0, "y": 71.21 }, { "x": 7.0, "y": 75.24 }, { "x": 8.0, "y": 77.23 }, { "x": 9.0, "y": 78.45 }, { "x": 10.0, "y": 79.08 }], "mean": [{ "x": 1.0, "y": 50.118 }, { "x": 2.0, "y": 58.21 }, { "x": 3.0, "y": 62.762 }, { "x": 4.0, "y": 66.966 }, { "x": 5.0, "y": 70.962 }, { "x": 6.0, "y": 73.33 }, { "x": 7.0, "y": 76.066 }, { "x": 8.0, "y": 78.122 }, { "x": 9.0, "y": 79.312 }, { "x": 10.0, "y": 79.822 }] }], [{ "label": "RoPE, teleport", "upper": [{ "x": 1.0, "y": 25.37 }, { "x": 2.0, "y": 37.31 }, { "x": 3.0, "y": 42.93 }, { "x": 4.0, "y": 46.46 }, { "x": 5.0, "y": 49.96 }, { "x": 6.0, "y": 51.01 }, { "x": 7.0, "y": 52.89 }, { "x": 8.0, "y": 54.39 }, { "x": 9.0, "y": 56.14 }, { "x": 10.0, "y": 56.73 }, { "x": 11.0, "y": 57.61 }, { "x": 12.0, "y": 57.08 }, { "x": 13.0, "y": 58.24 }, { "x": 14.0, "y": 58.34 }, { "x": 15.0, "y": 58.37 }, { "x": 16.0, "y": 58.55 }, { "x": 17.0, "y": 59.01 }, { "x": 18.0, "y": 59.06 }, { "x": 19.0, "y": 58.85 }, { "x": 20.0, "y": 59.65 }, { "x": 21.0, "y": 59.65 }, { "x": 22.0, "y": 60.29 }, { "x": 23.0, "y": 60.02 }, { "x": 24.0, "y": 60.34 }, { "x": 25.0, "y": 61.16 }, { "x": 26.0, "y": 61.33 }, { "x": 27.0, "y": 61.35 }, { "x": 28.0, "y": 61.52 }, { "x": 29.0, "y": 61.55 }, { "x": 30.0, "y": 61.65 }], "lower": [{ "x": 1.0, "y": 23.02 }, { "x": 2.0, "y": 34.24 }, { "x": 3.0, "y": 41.62 }, { "x": 4.0, "y": 45.18 }, { "x": 5.0, "y": 47.35 }, { "x": 6.0, "y": 50.09 }, { "x": 7.0, "y": 51.99 }, { "x": 8.0, "y": 52.9 }, { "x": 9.0, "y": 53.66 }, { "x": 10.0, "y": 54.61 }, { "x": 11.0, "y": 56.22 }, { "x": 12.0, "y": 55.85 }, { "x": 13.0, "y": 56.71 }, { "x": 14.0, "y": 57.05 }, { "x": 15.0, "y": 57.36 }, { "x": 16.0, "y": 57.78 }, { "x": 17.0, "y": 57.4 }, { "x": 18.0, "y": 57.83 }, { "x": 19.0, "y": 58.4 }, { "x": 20.0, "y": 58.13 }, { "x": 21.0, "y": 58.37 }, { "x": 22.0, "y": 58.59 }, { "x": 23.0, "y": 58.99 }, { "x": 24.0, "y": 59.01 }, { "x": 25.0, "y": 59.34 }, { "x": 26.0, "y": 59.27 }, { "x": 27.0, "y": 59.86 }, { "x": 28.0, "y": 59.91 }, { "x": 29.0, "y": 59.88 }, { "x": 30.0, "y": 60.12 }], "mean": [{ "x": 1.0, "y": 24.086 }, { "x": 2.0, "y": 35.448 }, { "x": 3.0, "y": 42.356 }, { "x": 4.0, "y": 45.764 }, { "x": 5.0, "y": 48.862 }, { "x": 6.0, "y": 50.642 }, { "x": 7.0, "y": 52.438 }, { "x": 8.0, "y": 53.836 }, { "x": 9.0, "y": 54.724 }, { "x": 10.0, "y": 55.858 }, { "x": 11.0, "y": 56.612 }, { "x": 12.0, "y": 56.698 }, { "x": 13.0, "y": 57.564 }, { "x": 14.0, "y": 57.594 }, { "x": 15.0, "y": 58.04 }, { "x": 16.0, "y": 57.998 }, { "x": 17.0, "y": 58.462 }, { "x": 18.0, "y": 58.518 }, { "x": 19.0, "y": 58.68 }, { "x": 20.0, "y": 58.788 }, { "x": 21.0, "y": 58.914 }, { "x": 22.0, "y": 59.31 }, { "x": 23.0, "y": 59.534 }, { "x": 24.0, "y": 59.68 }, { "x": 25.0, "y": 60.188 }, { "x": 26.0, "y": 60.164 }, { "x": 27.0, "y": 60.418 }, { "x": 28.0, "y": 60.58 }, { "x": 29.0, "y": 60.55 }, { "x": 30.0, "y": 60.612 }] }, { "label": "RoPE, no teleport", "upper": [{ "x": 1.0, "y": 22.17 }, { "x": 2.0, "y": 33.23 }, { "x": 3.0, "y": 39.47 }, { "x": 4.0, "y": 45.14 }, { "x": 5.0, "y": 46.29 }, { "x": 6.0, "y": 49.96 }, { "x": 7.0, "y": 51.15 }, { "x": 8.0, "y": 53.07 }, { "x": 9.0, "y": 53.99 }, { "x": 10.0, "y": 54.9 }, { "x": 11.0, "y": 55.96 }, { "x": 12.0, "y": 56.5 }, { "x": 13.0, "y": 57.88 }, { "x": 14.0, "y": 57.57 }, { "x": 15.0, "y": 57.82 }, { "x": 16.0, "y": 57.49 }, { "x": 17.0, "y": 58.0 }, { "x": 18.0, "y": 57.9 }, { "x": 19.0, "y": 58.01 }, { "x": 20.0, "y": 58.2 }, { "x": 21.0, "y": 58.41 }, { "x": 22.0, "y": 59.1 }, { "x": 23.0, "y": 58.77 }, { "x": 24.0, "y": 59.08 }, { "x": 25.0, "y": 59.3 }, { "x": 26.0, "y": 59.91 }, { "x": 27.0, "y": 59.67 }, { "x": 28.0, "y": 60.02 }, { "x": 29.0, "y": 60.21 }, { "x": 30.0, "y": 60.09 }], "lower": [{ "x": 1.0, "y": 20.78 }, { "x": 2.0, "y": 31.22 }, { "x": 3.0, "y": 38.32 }, { "x": 4.0, "y": 40.89 }, { "x": 5.0, "y": 45.32 }, { "x": 6.0, "y": 48.53 }, { "x": 7.0, "y": 49.57 }, { "x": 8.0, "y": 51.64 }, { "x": 9.0, "y": 52.8 }, { "x": 10.0, "y": 53.73 }, { "x": 11.0, "y": 54.37 }, { "x": 12.0, "y": 55.13 }, { "x": 13.0, "y": 55.77 }, { "x": 14.0, "y": 55.82 }, { "x": 15.0, "y": 56.04 }, { "x": 16.0, "y": 56.66 }, { "x": 17.0, "y": 57.07 }, { "x": 18.0, "y": 56.6 }, { "x": 19.0, "y": 56.65 }, { "x": 20.0, "y": 57.25 }, { "x": 21.0, "y": 57.35 }, { "x": 22.0, "y": 57.71 }, { "x": 23.0, "y": 57.85 }, { "x": 24.0, "y": 58.05 }, { "x": 25.0, "y": 58.31 }, { "x": 26.0, "y": 58.26 }, { "x": 27.0, "y": 58.46 }, { "x": 28.0, "y": 58.58 }, { "x": 29.0, "y": 58.84 }, { "x": 30.0, "y": 58.81 }], "mean": [{ "x": 1.0, "y": 21.244 }, { "x": 2.0, "y": 32.152 }, { "x": 3.0, "y": 38.86 }, { "x": 4.0, "y": 43.05 }, { "x": 5.0, "y": 45.902 }, { "x": 6.0, "y": 48.908 }, { "x": 7.0, "y": 50.478 }, { "x": 8.0, "y": 52.36 }, { "x": 9.0, "y": 53.502 }, { "x": 10.0, "y": 54.502 }, { "x": 11.0, "y": 55.022 }, { "x": 12.0, "y": 55.904 }, { "x": 13.0, "y": 56.396 }, { "x": 14.0, "y": 56.734 }, { "x": 15.0, "y": 56.792 }, { "x": 16.0, "y": 57.068 }, { "x": 17.0, "y": 57.534 }, { "x": 18.0, "y": 57.316 }, { "x": 19.0, "y": 57.396 }, { "x": 20.0, "y": 57.83 }, { "x": 21.0, "y": 58.108 }, { "x": 22.0, "y": 58.32 }, { "x": 23.0, "y": 58.394 }, { "x": 24.0, "y": 58.492 }, { "x": 25.0, "y": 58.79 }, { "x": 26.0, "y": 58.882 }, { "x": 27.0, "y": 58.964 }, { "x": 28.0, "y": 59.112 }, { "x": 29.0, "y": 59.28 }, { "x": 30.0, "y": 59.246 }] }, { "label": "APE, teleport", "upper": [{ "x": 1.0, "y": 23.79 }, { "x": 2.0, "y": 31.99 }, { "x": 3.0, "y": 38.77 }, { "x": 4.0, "y": 43.13 }, { "x": 5.0, "y": 47.28 }, { "x": 6.0, "y": 48.16 }, { "x": 7.0, "y": 50.9 }, { "x": 8.0, "y": 51.97 }, { "x": 9.0, "y": 53.1 }, { "x": 10.0, "y": 54.19 }, { "x": 11.0, "y": 55.56 }, { "x": 12.0, "y": 55.33 }, { "x": 13.0, "y": 56.09 }, { "x": 14.0, "y": 56.38 }, { "x": 15.0, "y": 56.71 }, { "x": 16.0, "y": 56.29 }, { "x": 17.0, "y": 57.57 }, { "x": 18.0, "y": 56.67 }, { "x": 19.0, "y": 57.59 }, { "x": 20.0, "y": 57.55 }, { "x": 21.0, "y": 57.69 }, { "x": 22.0, "y": 57.52 }, { "x": 23.0, "y": 58.36 }, { "x": 24.0, "y": 58.56 }, { "x": 25.0, "y": 58.65 }, { "x": 26.0, "y": 58.99 }, { "x": 27.0, "y": 59.04 }, { "x": 28.0, "y": 59.43 }, { "x": 29.0, "y": 59.58 }, { "x": 30.0, "y": 59.67 }], "lower": [{ "x": 1.0, "y": 20.49 }, { "x": 2.0, "y": 30.74 }, { "x": 3.0, "y": 37.36 }, { "x": 4.0, "y": 41.91 }, { "x": 5.0, "y": 45.33 }, { "x": 6.0, "y": 46.95 }, { "x": 7.0, "y": 48.48 }, { "x": 8.0, "y": 50.27 }, { "x": 9.0, "y": 51.9 }, { "x": 10.0, "y": 53.11 }, { "x": 11.0, "y": 54.37 }, { "x": 12.0, "y": 54.31 }, { "x": 13.0, "y": 54.81 }, { "x": 14.0, "y": 55.01 }, { "x": 15.0, "y": 55.71 }, { "x": 16.0, "y": 55.85 }, { "x": 17.0, "y": 55.92 }, { "x": 18.0, "y": 55.84 }, { "x": 19.0, "y": 55.97 }, { "x": 20.0, "y": 56.02 }, { "x": 21.0, "y": 57.09 }, { "x": 22.0, "y": 56.88 }, { "x": 23.0, "y": 57.4 }, { "x": 24.0, "y": 57.24 }, { "x": 25.0, "y": 57.74 }, { "x": 26.0, "y": 57.85 }, { "x": 27.0, "y": 58.06 }, { "x": 28.0, "y": 58.25 }, { "x": 29.0, "y": 58.49 }, { "x": 30.0, "y": 58.41 }], "mean": [{ "x": 1.0, "y": 22.658 }, { "x": 2.0, "y": 31.38 }, { "x": 3.0, "y": 38.298 }, { "x": 4.0, "y": 42.662 }, { "x": 5.0, "y": 46.026 }, { "x": 6.0, "y": 47.648 }, { "x": 7.0, "y": 49.59 }, { "x": 8.0, "y": 51.184 }, { "x": 9.0, "y": 52.58 }, { "x": 10.0, "y": 53.536 }, { "x": 11.0, "y": 54.806 }, { "x": 12.0, "y": 54.748 }, { "x": 13.0, "y": 55.362 }, { "x": 14.0, "y": 55.838 }, { "x": 15.0, "y": 56.274 }, { "x": 16.0, "y": 56.076 }, { "x": 17.0, "y": 56.668 }, { "x": 18.0, "y": 56.408 }, { "x": 19.0, "y": 56.75 }, { "x": 20.0, "y": 56.666 }, { "x": 21.0, "y": 57.402 }, { "x": 22.0, "y": 57.24 }, { "x": 23.0, "y": 57.682 }, { "x": 24.0, "y": 57.952 }, { "x": 25.0, "y": 58.088 }, { "x": 26.0, "y": 58.29 }, { "x": 27.0, "y": 58.468 }, { "x": 28.0, "y": 58.75 }, { "x": 29.0, "y": 58.77 }, { "x": 30.0, "y": 58.774 }] }, { "label": "APE, no teleport", "upper": [{ "x": 1.0, "y": 20.65 }, { "x": 2.0, "y": 27.59 }, { "x": 3.0, "y": 32.29 }, { "x": 4.0, "y": 36.69 }, { "x": 5.0, "y": 41.3 }, { "x": 6.0, "y": 43.81 }, { "x": 7.0, "y": 45.79 }, { "x": 8.0, "y": 48.13 }, { "x": 9.0, "y": 49.19 }, { "x": 10.0, "y": 50.54 }, { "x": 11.0, "y": 51.9 }, { "x": 12.0, "y": 52.9 }, { "x": 13.0, "y": 53.31 }, { "x": 14.0, "y": 53.63 }, { "x": 15.0, "y": 54.24 }, { "x": 16.0, "y": 53.59 }, { "x": 17.0, "y": 54.83 }, { "x": 18.0, "y": 54.71 }, { "x": 19.0, "y": 54.83 }, { "x": 20.0, "y": 54.88 }, { "x": 21.0, "y": 54.76 }, { "x": 22.0, "y": 55.37 }, { "x": 23.0, "y": 55.65 }, { "x": 24.0, "y": 55.9 }, { "x": 25.0, "y": 55.81 }, { "x": 26.0, "y": 56.12 }, { "x": 27.0, "y": 56.04 }, { "x": 28.0, "y": 56.47 }, { "x": 29.0, "y": 56.62 }, { "x": 30.0, "y": 56.37 }], "lower": [{ "x": 1.0, "y": 18.66 }, { "x": 2.0, "y": 24.63 }, { "x": 3.0, "y": 30.74 }, { "x": 4.0, "y": 35.53 }, { "x": 5.0, "y": 38.46 }, { "x": 6.0, "y": 42.08 }, { "x": 7.0, "y": 44.56 }, { "x": 8.0, "y": 46.29 }, { "x": 9.0, "y": 47.65 }, { "x": 10.0, "y": 49.44 }, { "x": 11.0, "y": 50.51 }, { "x": 12.0, "y": 51.51 }, { "x": 13.0, "y": 52.34 }, { "x": 14.0, "y": 52.47 }, { "x": 15.0, "y": 53.18 }, { "x": 16.0, "y": 52.56 }, { "x": 17.0, "y": 53.56 }, { "x": 18.0, "y": 53.13 }, { "x": 19.0, "y": 53.81 }, { "x": 20.0, "y": 53.93 }, { "x": 21.0, "y": 53.99 }, { "x": 22.0, "y": 53.5 }, { "x": 23.0, "y": 54.29 }, { "x": 24.0, "y": 54.49 }, { "x": 25.0, "y": 54.78 }, { "x": 26.0, "y": 55.06 }, { "x": 27.0, "y": 54.86 }, { "x": 28.0, "y": 54.91 }, { "x": 29.0, "y": 54.92 }, { "x": 30.0, "y": 54.95 }], "mean": [{ "x": 1.0, "y": 19.326 }, { "x": 2.0, "y": 25.944 }, { "x": 3.0, "y": 31.394 }, { "x": 4.0, "y": 36.252 }, { "x": 5.0, "y": 39.92 }, { "x": 6.0, "y": 42.998 }, { "x": 7.0, "y": 45.176 }, { "x": 8.0, "y": 46.962 }, { "x": 9.0, "y": 48.618 }, { "x": 10.0, "y": 49.978 }, { "x": 11.0, "y": 51.242 }, { "x": 12.0, "y": 52.146 }, { "x": 13.0, "y": 52.776 }, { "x": 14.0, "y": 53.078 }, { "x": 15.0, "y": 53.52 }, { "x": 16.0, "y": 53.24 }, { "x": 17.0, "y": 54.16 }, { "x": 18.0, "y": 54.076 }, { "x": 19.0, "y": 54.322 }, { "x": 20.0, "y": 54.384 }, { "x": 21.0, "y": 54.474 }, { "x": 22.0, "y": 54.666 }, { "x": 23.0, "y": 54.916 }, { "x": 24.0, "y": 55.292 }, { "x": 25.0, "y": 55.314 }, { "x": 26.0, "y": 55.496 }, { "x": 27.0, "y": 55.394 }, { "x": 28.0, "y": 55.63 }, { "x": 29.0, "y": 55.8 }, { "x": 30.0, "y": 55.734 }] }]];
     function makeDatasets(seriesList) {
       const datasets = [];
       seriesList.forEach((series) => {
-        const color = series.label.startsWith("APE") ? "#d85b66" : "#5279d8";
+        const isApe = series.label.startsWith("APE");
+        const color = isApe ? "#df7545" : "#2866b5";
         const key = series.label.replaceAll(" ", "-").toLowerCase();
-        datasets.push({ label: key + "-lower", data: series.lower, parsing: false, borderWidth: 0, pointRadius: 0, pointHitRadius: 0, backgroundColor: "transparent", fill: false, bandHelper: true, order: series.label.endsWith("no teleport") ? 1 : 0 });
-        datasets.push({ label: key + "-range", data: series.upper, parsing: false, borderWidth: 0, pointRadius: 0, pointHitRadius: 0, backgroundColor: series.label.startsWith("APE") ? "rgba(216,91,102,.13)" : "rgba(82,121,216,.13)", fill: "-1", bandHelper: true, order: series.label.endsWith("no teleport") ? 1 : 0 });
-        datasets.push({ label: series.label, data: series.mean, parsing: false, borderColor: color, backgroundColor: color, borderWidth: 2.4, borderDash: series.label.endsWith("no teleport") ? [7, 5] : [], pointRadius: 2.2, pointHoverRadius: 5, pointHitRadius: 12, tension: .18, order: series.label.endsWith("no teleport") ? 1 : 0 });
+        const order = series.label.endsWith("no teleport") ? 1 : 0;
+        datasets.push({ label: key + "-lower", data: series.lower, parsing: false, borderWidth: 0, pointRadius: 0, pointHitRadius: 0, backgroundColor: "transparent", fill: false, bandHelper: true, order });
+        datasets.push({ label: key + "-range", data: series.upper, parsing: false, borderWidth: 0, pointRadius: 0, pointHitRadius: 0, backgroundColor: isApe ? "rgba(223,117,69,.13)" : "rgba(40,102,181,.13)", fill: "-1", bandHelper: true, order });
+        datasets.push({ label: series.label, data: series.mean, parsing: false, borderColor: color, backgroundColor: color, borderWidth: 2.2, borderDash: series.label.endsWith("no teleport") ? [6, 5] : [], pointRadius: 2, pointHoverRadius: 4, pointHitRadius: 12, tension: .18, order });
       });
       return datasets;
     }
-    function buildChart(canvasId, seriesList) {
-      const maxEpoch = seriesList[0].mean.length;
-      new Chart(document.getElementById(canvasId), {
-        type: "line", data: { datasets: makeDatasets(seriesList) },
+    const chartCanvas = document.getElementById("trainingChart");
+    const chart = new Chart(chartCanvas, {
+        type: "line", data: { datasets: makeDatasets(curveData[0]) },
         options: {
           responsive: true, maintainAspectRatio: false,
           interaction: { mode: "index", intersect: false, axis: "x" },
           plugins: {
-            legend: { position: "bottom", labels: { usePointStyle: true, pointStyle: "line", boxWidth: 25, padding: 18, color: "#626a80", font: { family: "Manrope", size: 10, weight: "600" }, filter: (item, data) => !data.datasets[item.datasetIndex].bandHelper, sort: (a, b) => a.datasetIndex - b.datasetIndex } },
-            tooltip: { enabled: true, itemSort: (a, b) => a.datasetIndex - b.datasetIndex, filter: item => !item.dataset.bandHelper, backgroundColor: "#171c31", titleFont: { family: "DM Mono", size: 11 }, bodyFont: { family: "DM Mono", size: 11 }, padding: 12, cornerRadius: 7, displayColors: true, callbacks: { title: items => "Epoch " + items[0].parsed.x, label: ctx => " " + ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3) + "%" } }
+            legend: { position: "bottom", labels: { usePointStyle: true, pointStyle: "line", boxWidth: 22, padding: 14, color: "#526176", font: { family: "Arial", size: 10, weight: "600" }, filter: (item, data) => !data.datasets[item.datasetIndex].bandHelper, sort: (a, b) => a.datasetIndex - b.datasetIndex } },
+            tooltip: { enabled: true, itemSort: (a, b) => a.datasetIndex - b.datasetIndex, filter: item => !item.dataset.bandHelper, backgroundColor: "#14243a", titleFont: { family: "monospace", size: 11 }, bodyFont: { family: "monospace", size: 11 }, padding: 11, cornerRadius: 6, displayColors: true, callbacks: { title: items => "Epoch " + items[0].parsed.x, label: ctx => " " + ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3) + "%" } }
           },
           scales: {
-            x: { type: "linear", min: 1, max: maxEpoch, title: { display: true, text: "Epoch", color: "#7d8498", font: { family: "Manrope", size: 10, weight: "600" } }, ticks: { stepSize: maxEpoch === 10 ? 1 : 5, color: "#858ca0", font: { size: 9 } }, grid: { color: "rgba(100,110,140,.11)", borderDash: [3, 4] } },
-            y: { title: { display: true, text: "Validation accuracy (%)", color: "#7d8498", font: { family: "Manrope", size: 10, weight: "600" } }, ticks: { color: "#858ca0", font: { size: 9 } }, grid: { color: "rgba(100,110,140,.11)", borderDash: [3, 4] } }
+            x: { type: "linear", min: 1, max: 10, title: { display: true, text: "Epoch", color: "#65758b", font: { size: 10 } }, ticks: { stepSize: 1, color: "#718096", font: { size: 9 } }, grid: { color: "rgba(89,112,142,.12)" } },
+            y: { title: { display: true, text: "Validation accuracy (%)", color: "#65758b", font: { size: 10 } }, ticks: { color: "#718096", font: { size: 9 } }, grid: { color: "rgba(89,112,142,.12)" } }
           }
         }
       });
+
+    function selectDataset(index) {
+      const series = curveData[index];
+      const epochs = series[0].mean.length;
+      chart.data.datasets = makeDatasets(series);
+      chart.options.scales.x.max = epochs;
+      chart.options.scales.x.ticks.stepSize = epochs === 10 ? 1 : 5;
+      chartCanvas.setAttribute("aria-label", (index === 0 ? "CIFAR-10" : "CIFAR-100") + " validation accuracy chart");
+      document.getElementById("activeDatasetName").textContent = index === 0 ? "CIFAR-10" : "CIFAR-100";
+      document.getElementById("activeDatasetEpochs").textContent = epochs + " epochs";
+      document.querySelectorAll(".dataset-option").forEach(button => {
+        const selected = Number(button.dataset.dataset) === index;
+        button.classList.toggle("is-selected", selected);
+        button.setAttribute("aria-pressed", String(selected));
+      });
+      chart.update();
     }
-    buildChart("cifar10Chart", curveData[0]);
-    buildChart("cifar100Chart", curveData[1]);
+    document.querySelectorAll(".dataset-option").forEach(button => button.addEventListener("click", () => selectDataset(Number(button.dataset.dataset))));
+
+    function updateChartTheme(dark) {
+      const tick = dark ? "#a8b7cc" : "#718096";
+      const title = dark ? "#c1cee0" : "#65758b";
+      const grid = dark ? "rgba(160,180,210,.14)" : "rgba(89,112,142,.12)";
+      const legend = dark ? "#c1cee0" : "#526176";
+      const tooltipBg = dark ? "#e8eef8" : "#14243a";
+      const tooltipText = dark ? "#14243a" : "#ffffff";
+      Object.values(Chart.instances).forEach(chart => {
+        chart.options.plugins.legend.labels.color = legend;
+        chart.options.plugins.tooltip.backgroundColor = tooltipBg;
+        chart.options.plugins.tooltip.titleColor = tooltipText;
+        chart.options.plugins.tooltip.bodyColor = tooltipText;
+        for (const axis of Object.values(chart.options.scales)) {
+          axis.ticks.color = tick;
+          axis.grid.color = grid;
+          if (axis.title) axis.title.color = title;
+        }
+        chart.update("none");
+      });
+    }
+    updateChartTheme(document.documentElement.dataset.theme === "dark");
   </script>
-
 </body>
-
 </html>
