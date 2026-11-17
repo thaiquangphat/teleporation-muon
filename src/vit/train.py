@@ -137,7 +137,7 @@ def build_run_name(args):
     nesterov_suffix = "_nesterov" if args.nesterov else ""
     if args.tele_method == "none" and args.n_teleport <= 0:
         return (
-            f"NoTeleport-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
+            f"NoTeleport-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_dataset{args.dataset}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
         )
     return (
         f"Teleport-{args.tele_method}-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_dataset{args.dataset}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
