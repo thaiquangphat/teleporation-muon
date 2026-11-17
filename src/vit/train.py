@@ -140,7 +140,7 @@ def build_run_name(args):
             f"NoTeleport-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
         )
     return (
-        f"Teleport-{args.tele_method}-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
+        f"Teleport-{args.tele_method}-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_dataset{args.dataset}_batch{args.batch_size}_embeded{args.position_embedding}_opt{args.opt}"
         f"att{args.tele_att}_mlp{args.tele_mlp}_"
         f"tele-opt{args.tele_opt}_tele-high{args.tele_high}_tele-low{args.tele_low}_tele-cons{args.tele_cons}_tele-sign{args.tele_sign}_"
         f"tele-layer{args.tele_layer}_tele-batch{args.tele_batch}_tele-epoch{args.tele_epoch_array}_cands{args.tele_candidates}_seed{args.seed}"

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -e
+
+source ./wandb_config.sh
+load_wandb_config
+
+DATASETS=("IMAGENET" "CIFAR100" "CIFAR10")
+NUM_CLASSES=(1000 100 10)
+TELE_BATCH=(4 1 1)
+TELE_CONS=(4 1 1)
+N_TELEPORT=(6 3 3)
+
+run_for_seeds() {
+    for seed in 1 2 3 4 5; do
+        python3 src/vit/train.py --seed "$seed" "$@"
+    done
+}
+
+for i in "${!DATASETS[@]}"; do
+
+    DATASET="${DATASETS[$i]}"
+    CLASSES="${NUM_CLASSES[$i]}"
+    T_BATCH="${TELE_BATCH[$i]}"
+    T_CONS="${TELE_CONS[$i]}"
+    N_TELE="${N_TELEPORT[$i]}"
+
+    echo "Running $DATASET"
+
+    COMMON_ARGS=(
+        --dataset "$DATASET"
+        --img-size 32
+        --num_channels 3
+        --num-classes "$CLASSES"
+        --batch-size 256
+        --epochs 30
+        --d-model 192
+        --intermediate-size 768
+        --num-heads 3
+        --position-embedding "rope"
+        --opt "muon"
+        --lr 0.01
+        --momentum 0.9
+        --weight_decay 1e-5
+    )
+
+    TELE_ARGS=(
+        --tele-att 1
+        --tele-mlp 0
+        --tele-opt 1
+        --tele-sign 0
+        --tele-layer "all"
+        --tele-batch "$T_BATCH"
+        --tele-cons "$T_CONS"
+        --tele-high 1.55
+        --tele-low 0.45
+        --tele-epoch-array 1,6
+    )
+
+    SAVE_DIR="./checkpoints-vit/$DATASET"
+
+    # Plain Muon baseline
+    run_for_seeds "${COMMON_ARGS[@]}" \
+        --save_dir "$SAVE_DIR/plain"
+
+    # Naive teleportation Muon
+    run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
+        --tele-method naive \
+        --n-teleport "$N_TELE" \
+        --save_dir "$SAVE_DIR/naive"
+
+    # CSD-L2 Muon teleportation
+    run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
+        --tele-method csd_l2 \
+        --tele-candidates "$N_TELE" \
+        --save_dir "$SAVE_DIR/csd_l2"
+
+    # CSD-L2-Nesterov with nuclear norm scoring
+    run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
+        --tele-method csd_l2_nesterov \
+        --nesterov \
+        --tele-candidates "$N_TELE" \
+        --save_dir "$SAVE_DIR/csd_l2_nesterov"
+
+    # CSD-L2-Nesterov with Frobenius norm scoring
+    run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
+        --tele-method csd_l2_nesterov_frobenius \
+        --nesterov \
+        --tele-candidates "$N_TELE" \
+        --save_dir "$SAVE_DIR/csd_l2_nesterov_frobenius"
+
+    # CSD-L2-Nesterov with post-orthogonalization nuclear norm scoring
+    run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
+        --tele-method csd_l2_nesterov_post_orth \
+        --nesterov \
+        --tele-candidates "$N_TELE" \
+        --save_dir "$SAVE_DIR/csd_l2_nesterov_post_orth"
+
+    # CSD-L2-Nesterov with post-orthogonalization Frobenius scoring
+    run_for_seeds "${COMMON_ARGS[@]}" "${TELE_ARGS[@]}" \
+        --tele-method csd_l2_nesterov_post_orth_frobenius \
+        --nesterov \
+        --tele-candidates "$N_TELE" \
+        --save_dir "$SAVE_DIR/csd_l2_nesterov_post_orth_frobenius"
+
+done
