@@ -9,6 +9,7 @@ NUM_CLASSES=(1000 100 10)
 TELE_BATCH=(4 1 1)
 TELE_CONS=(4 1 1)
 N_TELEPORT=(6 3 3)
+EPOCHS=(30 30 10)
 
 run_for_seeds() {
     for seed in 1 2 3 4 5; do
@@ -23,6 +24,7 @@ for i in "${!DATASETS[@]}"; do
     T_BATCH="${TELE_BATCH[$i]}"
     T_CONS="${TELE_CONS[$i]}"
     N_TELE="${N_TELEPORT[$i]}"
+    EPOCHS="${EPOCHS[$i]}"
 
     echo "Running $DATASET"
 
@@ -32,7 +34,7 @@ for i in "${!DATASETS[@]}"; do
         --num_channels 3
         --num-classes "$CLASSES"
         --batch-size 256
-        --epochs 30
+        --epochs "$EPOCHS"
         --d-model 192
         --intermediate-size 768
         --num-heads 3
