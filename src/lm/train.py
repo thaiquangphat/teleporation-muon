@@ -263,25 +263,22 @@ def build_run_name(args: argparse.Namespace) -> str:
     if args.tele_method == "naive":
         teleport_tag = (
             f"-ntele{args.n_teleport}-att{args.tele_att}-mlp{args.tele_mlp}"
-            f"-layer{args.tele_layer}-teleint{args.tele_interval}-telebatch{args.tele_batch}"
+            f"-teleint{args.tele_interval}-telebatch{args.tele_batch}"
             f"-telecons{args.tele_cons}-start{args.tele_start_step}-limit{args.tele_limit_step}"
         )
     elif args.tele_method in CSD_TELE_METHODS:
         teleport_tag = (
             f"-cands{args.tele_candidates}-att{args.tele_att}-mlp{args.tele_mlp}"
-            f"-layer{args.tele_layer}-teleint{args.tele_interval}-telebatch{args.tele_batch}"
+            f"-teleint{args.tele_interval}-telebatch{args.tele_batch}"
             f"-telecons{args.tele_cons}-start{args.tele_start_step}-limit{args.tele_limit_step}"
         )
     else:
         teleport_tag = ""
     return (
         f"WikiText-{args.dataset_config}-{model_tag}-{args.position_embedding}-"
-        f"d{args.d_model}-L{args.num_hidden_layers}-H{args.num_heads}-I{args.intermediate_size}-"
-        f"act{args.activation}-drop{args.dropout}-attdrop{args.attention_dropout}-"
-        f"{args.opt}-lr{args.lr}-adam{args.adam_lr}-bs{args.batch_size}-"
-        f"block{args.block_size}-frac{args.train_fraction:g}-dseed{args.data_seed}-"
-        f"steps{args.max_steps}-warmup{args.warmup_steps}-eval{args.eval_interval}-"
-        f"sched{args.lr_scheduler}-{args.tele_method}-nag{int(args.nesterov)}"
+        f"tele-high{args.tele_high}-tele-low{args.tele_low}"
+        f"{args.opt}-lr{args.lr}-adam{args.adam_lr}-"
+        f"{args.tele_method}-nag{int(args.nesterov)}"
         f"{teleport_tag}-seed{args.seed}"
     )
 
