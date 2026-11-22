@@ -63,33 +63,130 @@ def snapshot_live_state(model: nn.Module, optimizer: torch.optim.Optimizer) -> D
     }
 
 
-def assert_live_state_unchanged(model: nn.Module, optimizer: torch.optim.Optimizer, snapshot: Dict[str, Any]) -> None:
+def _tensor_equal_nan_aware(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Exact tensor equality, treating NaNs at matching positions as equal.
+
+    ``torch.equal`` returns False when corresponding entries are NaN, even
+    when both tensors contain NaN at exactly the same positions. CSD's virtual
+    search snapshots the live state, so that behavior can incorrectly report
+    a mutation that did not occur.
+    """
+    if left.shape != right.shape or left.dtype != right.dtype:
+        return False
+
+    if left.is_floating_point() or left.is_complex():
+        same = (left == right) | (torch.isnan(left) & torch.isnan(right))
+        return bool(torch.all(same).item())
+
+    return torch.equal(left, right)
+
+
+def _nonfinite_counts(value: torch.Tensor) -> tuple[int, int]:
+    """Return (NaN count, Inf count); integer/bool tensors have no non-finites."""
+    if not (value.is_floating_point() or value.is_complex()):
+        return 0, 0
+    return (
+        int(torch.isnan(value).sum().item()),
+        int(torch.isinf(value).sum().item()),
+    )
+
+
+def _assert_tensor_snapshot_unchanged(
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    description: str,
+) -> None:
+    """Check exact state preservation, then separately report pre-existing NaNs."""
+    if not _tensor_equal_nan_aware(current.detach(), previous):
+        raise RuntimeError(
+            f"Virtual CSD search changed {description}. "
+            "The live tensor differs from its pre-search snapshot."
+        )
+
+    nan_count, inf_count = _nonfinite_counts(current.detach())
+    if nan_count or inf_count:
+        raise RuntimeError(
+            f"Non-finite values were already present in {description} during the "
+            f"virtual CSD integrity check (NaNs={nan_count}, Infs={inf_count}). "
+            "The snapshot comparison found no mutation, but training is already "
+            "numerically unstable. Check the loss, gradients, learning rates, "
+            "and optimizer state before this teleportation step."
+        )
+
+
+def _scalar_equal_nan_aware(left: Any, right: Any) -> bool:
+    """Compare optimizer scalar state without treating matching NaNs as changes."""
+    if isinstance(left, float) and isinstance(right, float):
+        return left == right or (math.isnan(left) and math.isnan(right))
+    return left == right
+
+
+def assert_live_state_unchanged(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    snapshot: Dict[str, Any],
+) -> None:
+    """Verify virtual candidate evaluation did not mutate the live training state.
+
+    Matching NaNs are treated as equal for the mutation test, but are then
+    reported explicitly as pre-existing numerical instability. This prevents
+    the misleading ``changed live parameter`` error without silently allowing
+    a model containing NaN/Inf values to continue training.
+    """
     if model.training != snapshot["training"]:
         raise RuntimeError("Virtual CSD search changed the live model mode")
+
     parameters = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
+
     for name, parameter in parameters.items():
-        if not torch.equal(parameter.detach(), snapshot["params"][name]):
-            raise RuntimeError(f"Virtual CSD search changed live parameter {name}")
-        live_grad, old_grad = parameter.grad, snapshot["grads"][name]
+        _assert_tensor_snapshot_unchanged(
+            parameter.detach(), snapshot["params"][name], f"live parameter {name}"
+        )
+
+        live_grad = parameter.grad
+        old_grad = snapshot["grads"][name]
         if live_grad is None and old_grad is None:
             pass
-        elif live_grad is None or old_grad is None or not torch.equal(live_grad, old_grad):
-            raise RuntimeError(f"Virtual CSD search changed live gradient {name}")
+        elif live_grad is None or old_grad is None:
+            raise RuntimeError(
+                f"Virtual CSD search changed gradient presence for parameter {name}"
+            )
+        else:
+            _assert_tensor_snapshot_unchanged(
+                live_grad.detach(), old_grad, f"live gradient for parameter {name}"
+            )
+
         live_state = optimizer.state.get(parameter, {})
         old_state = snapshot["optimizer_state"].get(name, {})
         if set(live_state) != set(old_state):
-            raise RuntimeError(f"Virtual CSD search changed optimizer state keys for {name}")
+            raise RuntimeError(
+                f"Virtual CSD search changed optimizer state keys for {name}: "
+                f"before={sorted(old_state)}, after={sorted(live_state)}"
+            )
+
         for key, old_value in old_state.items():
             live_value = live_state[key]
             if torch.is_tensor(old_value):
-                if not torch.equal(live_value, old_value):
-                    raise RuntimeError(f"Virtual CSD search changed optimizer state {name}.{key}")
-            elif live_value != old_value:
-                raise RuntimeError(f"Virtual CSD search changed optimizer state {name}.{key}")
+                if not torch.is_tensor(live_value):
+                    raise RuntimeError(
+                        f"Virtual CSD search changed optimizer state type for {name}.{key}"
+                    )
+                _assert_tensor_snapshot_unchanged(
+                    live_value.detach(), old_value, f"optimizer state {name}.{key}"
+                )
+            elif not _scalar_equal_nan_aware(live_value, old_value):
+                raise RuntimeError(
+                    f"Virtual CSD search changed optimizer state {name}.{key}"
+                )
+
+    if set(buffers) != set(snapshot["buffers"]):
+        raise RuntimeError("Virtual CSD search changed the live model buffer set")
+
     for name, buffer in buffers.items():
-        if not torch.equal(buffer, snapshot["buffers"][name]):
-            raise RuntimeError(f"Virtual CSD search changed live buffer {name}")
+        _assert_tensor_snapshot_unchanged(
+            buffer.detach(), snapshot["buffers"][name], f"live buffer {name}"
+        )
 
 
 def validate_bounds(low: float, high: float) -> Tuple[float, float]:
