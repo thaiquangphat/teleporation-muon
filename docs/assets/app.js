@@ -1,4 +1,4 @@
-// Muon Teleportation site: theme, hero animation, and data-driven results.
+// Muon Teleportation site: theme, hero animation, training demo, and data-driven results.
 
     // Theme preference: saved locally; otherwise follow the operating-system preference.
     (() => {
@@ -27,228 +27,173 @@
         try { localStorage.setItem("muon-theme", next); } catch (_) {}
       });
     })();
+  
 
-// ---------------------------------------------------------------------------
-// Hero animation
-// ---------------------------------------------------------------------------
+
+    // Hero: a Muon run that teleports along a loss contour, then makes larger steps.
+    (() => {
+      const svg = document.getElementById("heroSvg"), NS = "http://www.w3.org/2000/svg";
+      const C = { x: 560, y: 200 }, A = -0.2, rx = 70, ry = 34;
+      const P = (k, t) => { t *= Math.PI / 180; const x = k * rx * Math.cos(t), y = k * ry * Math.sin(t); return [C.x + x * Math.cos(A) - y * Math.sin(A), C.y + x * Math.sin(A) + y * Math.cos(A)]; };
+      const mk = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); svg.appendChild(e); return e; };
+      [1, 2, 3, 4, 4.1, 5].forEach((k, i) => { if (k !== 4.1) mk("ellipse", { cx: C.x, cy: C.y, rx: k * rx, ry: k * ry, transform: `rotate(${A * 180 / Math.PI} ${C.x} ${C.y})`, class: "contour" + (k === 1 ? " min" : "") }); });
+      const seq = [], add = (el, gap) => { el.classList.add("h"); seq.push([el, gap]); return el; };
+      const dot = (p, r = 5, c = "dot") => add(mk("circle", { cx: p[0], cy: p[1], r, class: c }), 0);
+      const seg = (a, b) => add(mk("line", { x1: a[0], y1: a[1], x2: b[0], y2: b[1], class: "seg" }), 330);
+      const one = [[5, 186], [4.62, 188], [4.3, 190], [4.05, 192]].map(n => P(...n));
+      const two = [[4.05, 100], [3.0, 98], [1.9, 96], [0.9, 94], [0.08, 92]].map(n => P(...n));
+      dot(one[0]); for (let i = 1; i < one.length; i++) { seg(one[i - 1], one[i]); dot(one[i]); }
+      const arc = []; for (let t = 192; t >= 100; t -= 4) arc.push(P(4.05, t));
+      const hop = add(mk("path", { d: "M" + arc.map(p => p.join(",")).join("L"), class: "hop", pathLength: 1 }), 500);
+      dot(two[0], 7, "tdot"); seq[seq.length - 1][1] = 1000;
+      for (let i = 1; i < two.length; i++) { seg(two[i - 1], two[i]); dot(two[i], i === two.length - 1 ? 6 : 5); }
+      const text = (p, s, c) => { const t = mk("text", { x: p[0], y: p[1], class: "lbl " + (c || "") }); t.textContent = s; return t; };
+      text([40, 252], "Small steps");
+      text([70, 336], "Teleport along the contour", "t");
+      text([590, 300], "Larger steps, same optimizer");
+      text([C.x + 44, C.y - 44], "minimum");
+      const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      let timers = [];
+      const play = () => {
+        let t = 400;
+        seq.forEach(([el, gap]) => { t += gap || 330; timers.push(setTimeout(() => el.classList.add("on"), t)); });
+        timers.push(setTimeout(() => { seq.forEach(([el]) => el.classList.remove("on")); timers = []; play(); }, t + 3200));
+      };
+      if (reduce) seq.forEach(([el]) => el.classList.add("on")); else play();
+    })();
+  
 (() => {
-  const svg = document.getElementById("heroSvg");
-  if (!svg) return;
-  const NS = "http://www.w3.org/2000/svg";
-  const el = (name, attrs = {}, parent = svg) => {
-    const n = document.createElementNS(NS, name);
-    for (const k in attrs) n.setAttribute(k, attrs[k]);
-    parent.appendChild(n);
-    return n;
-  };
-  const CX = 640, CY = 205, ANG = -14, RX = 64, RY = 21;
-  const rad = ANG * Math.PI / 180;
-  const pt = (k, t) => {
-    const x = RX * k * Math.cos(t), y = RY * k * Math.sin(t);
-    return [CX + x * Math.cos(rad) - y * Math.sin(rad), CY + x * Math.sin(rad) + y * Math.cos(rad)];
-  };
-
-  // loss contours
-  for (let k = 7; k >= 1; k--) {
-    el("ellipse", { class: "contour" + (k === 1 ? " min" : ""), cx: CX, cy: CY, rx: RX * k, ry: RY * k, transform: `rotate(${ANG} ${CX} ${CY})` });
-  }
-
-  // path of the optimizer
-  const small = [pt(6.4, 3.55), pt(6.15, 3.5), pt(5.9, 3.45), pt(5.65, 3.4)];
-  const tele = pt(5.65, 5.15);
-  const big = [tele, pt(3.9, 5.0), pt(2.3, 4.7), pt(0.2, 0)];
-
-  const steps = []; // elements revealed in order, with delays (ms)
-  const addLine = (a, b, delay) => {
-    const l = el("line", { class: "seg h", x1: a[0], y1: a[1], x2: b[0], y2: b[1] });
-    steps.push([l, delay]);
-  };
-  const addDot = (p, cls, delay) => {
-    const d = el("circle", { class: cls + " h", cx: p[0], cy: p[1], r: cls === "tdot" ? 6.5 : 4.5 });
-    steps.push([d, delay]);
-    return d;
-  };
-  const addLabel = (txt, x, y, cls, delay, anchor = "start") => {
-    const t = el("text", { class: "lbl h" + (cls ? " " + cls : ""), x, y, "text-anchor": anchor });
-    t.textContent = txt;
-    steps.push([t, delay]);
-  };
-
-  addDot(small[0], "dot", 400);
-  for (let i = 1; i < small.length; i++) { addLine(small[i - 1], small[i], 450); addDot(small[i], "dot", 0); }
-  addLabel("small Muon steps", small[0][0] - 8, small[0][1] + 34, "", 200);
-
-  // teleport hop (quadratic arc drawn outside the valley)
-  const mx = (small[3][0] + tele[0]) / 2 - 150, my = (small[3][1] + tele[1]) / 2 - 10;
-  const hop = el("path", { class: "hop", pathLength: 1, d: `M${small[3][0]} ${small[3][1]} Q${mx} ${my} ${tele[0]} ${tele[1]}` });
-  const tdot = el("circle", { class: "tdot h", cx: tele[0], cy: tele[1], r: 7 });
-  addLabel("teleport: same loss", mx - 38, my - 2, "t", 500, "end");
-
-  for (let i = 1; i < big.length; i++) { addLine(big[i - 1], big[i], 520); addDot(big[i], "dot", 0); }
-  addLabel("larger steps", big[1][0] + 4, big[1][1] - 18, "", 200, "middle");
-
-  const all = [...svg.querySelectorAll(".h")];
-  let timers = [];
-  const clear = () => { timers.forEach(clearTimeout); timers = []; };
-  const later = (fn, ms) => timers.push(setTimeout(fn, ms));
-  const reset = () => { all.forEach(n => n.classList.remove("on")); hop.classList.remove("on"); tdot.classList.remove("on"); };
-  const showAll = () => { all.forEach(n => n.classList.add("on")); hop.classList.add("on"); };
-
-  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (reduce) { showAll(); return; }
-
-  const play = () => {
-    clear(); reset();
-    let t = 300;
-    let hopDone = false;
-    steps.forEach(([node, delay]) => {
-      // insert the teleport hop right before the first "big" element after the hop label
-      if (!hopDone && node.classList.contains("t")) {
-        t += delay;
-        later(() => { node.classList.add("on"); hop.classList.add("on"); }, t);
-        t += 1000;
-        later(() => tdot.classList.add("on"), t);
-        hopDone = true;
-        return;
-      }
-      t += delay;
-      later(() => node.classList.add("on"), t);
-    });
-    later(play, t + 3500);
-  };
-  play();
-})();
-
-// ---------------------------------------------------------------------------
-// Data-driven results
-// ---------------------------------------------------------------------------
-var trainingChart = null;
-var updateChartTheme = (dark) => { if (trainingChart) applyChartColors(trainingChart, dark); };
-
-function applyChartColors(chart, dark) {
-  const text = dark ? "#a1adc2" : "#566174";
-  const grid = dark ? "#232c42" : "#e1e5ef";
-  const o = chart.options;
-  o.scales.x.ticks.color = text; o.scales.y.ticks.color = text;
-  o.scales.x.title.color = text; o.scales.y.title.color = text;
-  o.scales.x.grid.color = grid; o.scales.y.grid.color = grid;
-  o.plugins.legend.labels.color = dark ? "#e9eef9" : "#101828";
-  chart.update("none");
-}
-
-(() => {
-  const data = window.MUON_RESULTS;
-  if (!data) { console.error("results data missing (data/results.js did not load)"); return; }
-  const isDark = () => document.documentElement.dataset.theme === "dark";
-  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
-  // headline facts
-  const facts = document.getElementById("facts");
-  if (facts) facts.innerHTML = (data.facts || []).map(f => `<div><b>${esc(f.value)}</b><span>${esc(f.label)}</span></div>`).join("");
-
-  // results table
-  const tableHost = document.getElementById("resultsTable");
-  if (tableHost) {
-    let html = `<table class="results-table"><thead><tr><th>Positional encoding</th><th>Teleport</th><th>Accuracy (%)</th><th>Epoch speedup</th><th>Wall-clock speedup</th><th>Time / epoch</th></tr></thead><tbody>`;
-    data.datasets.forEach(ds => {
-      html += `<tr class="dataset-row"><th colspan="6" scope="colgroup">${esc(ds.name)}</th></tr>`;
-      const seen = {};
-      ds.rows.forEach(r => {
-        const count = ds.rows.filter(x => x.encoding === r.encoding).length;
-        const first = !seen[r.encoding]; seen[r.encoding] = true;
-        const cell = (v) => `<td class="${r.best ? "best" : ""}">${esc(v)}</td>`;
-        html += `<tr class="${first ? "pe-start" : ""}">` + (first ? `<th scope="rowgroup" rowspan="${count}">${esc(r.encoding)}</th>` : "")
-          + `<td>${r.teleport ? "Yes" : "No"}</td>`
-          + `<td class="${r.best ? "best" : ""}">${esc(r.accuracy)}</td>`
-          + `<td>${esc(r.epochSpeedup)}</td><td>${esc(r.wallSpeedup)}</td><td>${esc(r.timePerEpoch)}</td></tr>`;
+  let DATA;
+  function initCharts() {
+  
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    // Builds the stat strip, results table and dataset buttons from data/results.json.
+    function buildPage() {
+      const factsEl = document.getElementById("facts"); // optional: remove #facts from index.html to hide the strip
+    if (factsEl) factsEl.innerHTML = (DATA.facts || []).map(f => `<div><b>${esc(f.value)}</b><span>${esc(f.label)}</span></div>`).join("");
+      let h = '<table class="results-table"><thead><tr><th>Encoding</th><th>Teleport</th><th>Accuracy ↑</th><th>Epoch speedup ↑</th><th>Wall-clock speedup ↑</th><th>Time/epoch ↓</th></tr></thead><tbody>';
+      DATA.datasets.forEach(d => {
+        h += `<tr class="dataset-row"><th colspan="6">${esc(d.name)}</th></tr>`;
+        const groups = [];
+        d.rows.forEach(r => { const g = groups[groups.length - 1]; if (g && g.enc === r.encoding) g.rows.push(r); else groups.push({ enc: r.encoding, rows: [r] }); });
+        groups.forEach(g => g.rows.forEach((r, i) => {
+          h += `<tr${i ? "" : ' class="pe-start"'}>` + (i ? "" : `<th rowspan="${g.rows.length}">${esc(g.enc)}</th>`) +
+            `<td>${r.teleport ? "Yes" : "No"}</td><td${r.best ? ' class="best"' : ""}>${esc(r.accuracy)}</td><td>${esc(r.epochSpeedup || "—")}</td><td>${esc(r.wallSpeedup || "—")}</td><td>${esc(r.timePerEpoch || "—")}</td></tr>`;
+        }));
       });
-    });
-    tableHost.innerHTML = html + "</tbody></table>";
-  }
-
-  // training curves
-  const canvas = document.getElementById("trainingChart");
-  if (!canvas || typeof Chart === "undefined") { console.error("Chart.js did not load"); return; }
-  let view = "epoch", active = 0;
-  const picker = document.getElementById("datasetPicker");
-  const nameEl = document.getElementById("activeDatasetName");
-  const epochsEl = document.getElementById("activeDatasetEpochs");
-  const noteEl = document.getElementById("chartNote");
-  const epochCount = (ds) => ds.curves.epoch[0].mean.length;
-
-  picker.innerHTML = data.datasets.map((ds, i) =>
-    `<button type="button" class="dataset-option${i === 0 ? " is-selected" : ""}" data-i="${i}" aria-pressed="${i === 0}"><span class="dataset-option-name">${esc(ds.name)}</span><span class="dataset-option-meta">${epochCount(ds)} epochs</span></button>`).join("");
-
-  const COLORS = { RoPE: { light: "#2f5fd0", dark: "#6f9bff" }, APE: { light: "#d9692f", dark: "#f0955f" } };
-  const colorFor = (label) => (COLORS[label.split(",")[0].trim()] || COLORS.RoPE)[isDark() ? "dark" : "light"];
-  const toPts = (arr) => arr.map(p => ({ x: p.x, y: p.y }));
-
-  function build() {
-    const ds = data.datasets[active];
-    const series = ds.curves[view];
-    const sets = [];
-    series.forEach(s => {
-      const c = colorFor(s.label);
-      const dashed = /no teleport/i.test(s.label);
-      sets.push({ label: s.label, data: toPts(s.mean), borderColor: c, backgroundColor: c, borderWidth: 2.4, borderDash: dashed ? [7, 5] : [], pointRadius: 0, pointHoverRadius: 4, tension: 0.25, _band: false });
-    });
-    series.forEach((s, i) => {
-      const c = colorFor(s.label);
-      const lowerIdx = sets.length;
-      sets.push({ label: s.label + " (min)", data: toPts(s.lower), borderWidth: 0, pointRadius: 0, pointHoverRadius: 0, fill: false, tension: 0.25, _band: true });
-      sets.push({ label: s.label + " (max)", data: toPts(s.upper), borderWidth: 0, pointRadius: 0, pointHoverRadius: 0, tension: 0.25, fill: lowerIdx, backgroundColor: c + "26", _band: true });
-    });
-    return sets;
-  }
-
-  function render() {
-    const ds = data.datasets[active];
-    nameEl.textContent = ds.name;
-    epochsEl.textContent = epochCount(ds) + " epochs";
-    canvas.setAttribute("aria-label", `${ds.name} validation accuracy versus ${view === "epoch" ? "epoch" : "wall-clock time"}`);
-    const xTitle = view === "epoch" ? "Epoch" : "Wall-clock time (s)";
-    if (!trainingChart) {
-      trainingChart = new Chart(canvas, {
-        type: "line",
-        data: { datasets: build() },
+      document.getElementById("resultsTable").innerHTML = h + "</tbody></table>";
+      document.getElementById("datasetPicker").innerHTML = DATA.datasets.map((d, i) =>
+        `<button class="dataset-option${i ? "" : " is-selected"}" type="button" data-dataset="${i}" aria-pressed="${!i}"><span class="dataset-option-name">${esc(d.name)}</span><span class="dataset-option-meta"></span></button>`).join("");
+    }
+  
+    buildPage();
+    const curveData = { epoch: DATA.datasets.map(d => d.curves.epoch), wall: DATA.datasets.map(d => d.curves.wall || d.curves.epoch) };
+    const DATASETS = DATA.datasets.map(d => d.name);
+  
+      // Per-configuration validation accuracy (%), mean over five seeds with min–max bands.
+      // epoch view: x = epoch. wall view: x = mean logged process time (s) at which each epoch finished.
+              const state = { view: "epoch", dataset: 0 };
+  
+      function seriesFor(view, dataset) { return curveData[view][dataset]; }
+      function makeDatasets(seriesList) {
+        const datasets = [];
+        seriesList.forEach((series) => {
+          const isApe = series.label.startsWith("APE");
+          const color = getComputedStyle(document.documentElement).getPropertyValue(isApe ? "--ape" : "--rope").trim();
+          const key = series.label.replaceAll(" ", "-").toLowerCase();
+          const order = series.label.endsWith("no teleport") ? 1 : 0;
+          datasets.push({ label: key + "-lower", data: series.lower, parsing: false, borderWidth: 0, pointRadius: 0, pointHitRadius: 0, backgroundColor: "transparent", fill: false, bandHelper: true, order });
+          datasets.push({ label: key + "-range", data: series.upper, parsing: false, borderWidth: 0, pointRadius: 0, pointHitRadius: 0, backgroundColor: color + "26", fill: "-1", bandHelper: true, order });
+          datasets.push({ label: series.label, data: series.mean, parsing: false, borderColor: color, backgroundColor: color, borderWidth: 2.2, borderDash: series.label.endsWith("no teleport") ? [6, 5] : [], pointRadius: 2, pointHoverRadius: 4, pointHitRadius: 12, tension: .18, order });
+        });
+        return datasets;
+      }
+      const chartCanvas = document.getElementById("trainingChart");
+      const chart = new Chart(chartCanvas, {
+        type: "line", data: { datasets: makeDatasets(seriesFor("epoch", 0)) },
         options: {
-          responsive: true, maintainAspectRatio: false, animation: { duration: 350 },
-          interaction: { mode: "nearest", intersect: false, axis: "x" },
-          parsing: false,
-          scales: {
-            x: { type: "linear", title: { display: true, text: xTitle }, ticks: { precision: 0 }, grid: {} },
-            y: { title: { display: true, text: "Validation accuracy (%)" }, grid: {}, ticks: {} }
-          },
+          responsive: true, maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false, axis: "x" },
           plugins: {
-            legend: { position: "bottom", labels: { usePointStyle: true, boxWidth: 8, filter: (item, d) => !d.datasets[item.datasetIndex]._band } },
-            tooltip: { filter: (item) => !item.dataset._band, callbacks: { label: (c) => `${c.dataset.label}: ${c.parsed.y.toFixed(2)}%` } }
+            legend: { position: "bottom", labels: { usePointStyle: true, pointStyle: "line", boxWidth: 22, padding: 14, color: "#526176", font: { family: "Bricolage Grotesque, system-ui, sans-serif", size: 10, weight: "600" }, filter: (item, data) => !data.datasets[item.datasetIndex].bandHelper, sort: (a, b) => a.datasetIndex - b.datasetIndex } },
+            tooltip: { enabled: true, itemSort: (a, b) => a.datasetIndex - b.datasetIndex, filter: item => !item.dataset.bandHelper, backgroundColor: "#14243a", titleFont: { family: "monospace", size: 11 }, bodyFont: { family: "monospace", size: 11 }, padding: 11, cornerRadius: 6, displayColors: true,
+              callbacks: {
+                title: items => state.view === "epoch" ? "Epoch " + items[0].parsed.x : "Epoch " + items[0].raw.e + " · " + items[0].parsed.x.toFixed(1) + " s",
+                label: ctx => " " + ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3) + "%"
+              } }
+          },
+          scales: {
+            x: { type: "linear", min: 1, max: 10, title: { display: true, text: "Epoch", color: "#65758b", font: { size: 10 } }, ticks: { stepSize: 1, color: "#718096", font: { size: 9 } }, grid: { color: "rgba(89,112,142,.12)" } },
+            y: { title: { display: true, text: "Validation accuracy (%)", color: "#65758b", font: { size: 10 } }, ticks: { color: "#718096", font: { size: 9 } }, grid: { color: "rgba(89,112,142,.12)" } }
           }
         }
       });
-    } else {
-      trainingChart.data.datasets = build();
-      trainingChart.options.scales.x.title.text = xTitle;
-    }
-    applyChartColors(trainingChart, isDark());
+  
+      const totalTime = d => Math.max(...seriesFor("wall", d).map(s => s.mean[s.mean.length - 1].x));
+      function render() {
+        const { view, dataset } = state;
+        const list = seriesFor(view, dataset);
+        const epochs = curveData.epoch[dataset][0].mean.length;
+        const xs = chart.options.scales.x;
+        chart.data.datasets = makeDatasets(list);
+        if (view === "epoch") {
+          xs.min = 1; xs.max = epochs; xs.ticks.stepSize = epochs <= 15 ? 1 : 5; xs.title.text = "Epoch";
+          chart.options.interaction.mode = "index";
+        } else {
+          const tmax = totalTime(dataset);
+          xs.min = 0; xs.max = Math.ceil(tmax / 25) * 25; xs.ticks.stepSize = undefined; xs.title.text = "Wall-clock time (s)";
+          chart.options.interaction.mode = "nearest";
+        }
+        document.getElementById("activeDatasetName").textContent = DATASETS[dataset];
+        document.getElementById("activeDatasetEpochs").textContent = view === "epoch" ? epochs + " epochs" : "up to ≈ " + Math.round(totalTime(dataset)) + " s";
+        chartCanvas.setAttribute("aria-label", DATASETS[dataset] + " validation accuracy versus " + (view === "epoch" ? "epoch" : "wall-clock time"));
+        document.querySelectorAll(".dataset-option").forEach(b => {
+          const i = Number(b.dataset.dataset), sel = i === dataset;
+          b.classList.toggle("is-selected", sel); b.setAttribute("aria-pressed", String(sel));
+          b.querySelector(".dataset-option-meta").textContent = view === "epoch" ? curveData.epoch[i][0].mean.length + " epochs" : "≈ " + Math.round(totalTime(i)) + " s";
+        });
+        document.querySelectorAll(".view-option").forEach(b => {
+          const sel = b.dataset.view === view;
+          b.classList.toggle("is-selected", sel); b.setAttribute("aria-pressed", String(sel));
+        });
+        chart.update();
+      }
+      document.querySelectorAll(".dataset-option").forEach(b => b.addEventListener("click", () => { state.dataset = Number(b.dataset.dataset); render(); }));
+      document.querySelectorAll(".view-option").forEach(b => b.addEventListener("click", () => { state.view = b.dataset.view; render(); }));
+  
+      function updateChartTheme(dark) {
+        const tick = dark ? "#a8b7cc" : "#718096";
+        const title = dark ? "#c1cee0" : "#65758b";
+        const grid = dark ? "rgba(160,180,210,.14)" : "rgba(89,112,142,.12)";
+        const legend = dark ? "#c1cee0" : "#526176";
+        const tooltipBg = dark ? "#e8eef8" : "#14243a";
+        const tooltipText = dark ? "#14243a" : "#ffffff";
+        Object.values(Chart.instances).forEach(chart => {
+          chart.options.plugins.legend.labels.color = legend;
+          chart.options.plugins.tooltip.backgroundColor = tooltipBg;
+          chart.options.plugins.tooltip.titleColor = tooltipText;
+          chart.options.plugins.tooltip.bodyColor = tooltipText;
+          for (const axis of Object.values(chart.options.scales)) {
+            axis.ticks.color = tick;
+            axis.grid.color = grid;
+            if (axis.title) axis.title.color = title;
+          }
+          chart.update("none");
+        });
+        if (typeof render === "function") render();
+      }
+      render();
+      updateChartTheme(document.documentElement.dataset.theme === "dark");
+    
+    window.updateChartTheme = updateChartTheme;
   }
-
-  // re-colour series on theme change
-  updateChartTheme = (dark) => {
-    if (!trainingChart) return;
-    trainingChart.data.datasets = build();
-    applyChartColors(trainingChart, dark);
-  };
-
-  picker.addEventListener("click", (e) => {
-    const b = e.target.closest(".dataset-option"); if (!b) return;
-    active = +b.dataset.i;
-    picker.querySelectorAll(".dataset-option").forEach(x => { const on = x === b; x.classList.toggle("is-selected", on); x.setAttribute("aria-pressed", on); });
-    render();
-  });
-  document.querySelectorAll(".view-option").forEach(b => b.addEventListener("click", () => {
-    view = b.dataset.view;
-    document.querySelectorAll(".view-option").forEach(x => { const on = x === b; x.classList.toggle("is-selected", on); x.setAttribute("aria-pressed", on); });
-    render();
-  }));
-  render();
+  const show = msg => { document.getElementById("resultsTable").innerHTML = '<p class="small-note" style="padding:16px">' + msg + "</p>"; };
+  // Server: read data/results.json. Opened as a local file, browsers block fetch, so use data/results.js.
+  const loadData = () => fetch("data/results.json")
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .catch(() => { if (window.MUON_RESULTS) return window.MUON_RESULTS; throw new Error("no data"); });
+  loadData().then(
+    d => { DATA = d; try { initCharts(); } catch (e) { console.error(e); show("Could not draw the results. See the browser console for details."); } },
+    () => show("Could not load the results data. Check that data/results.json (or data/results.js) exists.")
+  );
 })();
