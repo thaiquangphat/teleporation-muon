@@ -78,7 +78,7 @@
         d.rows.forEach(r => { const g = groups[groups.length - 1]; if (g && g.enc === r.encoding) g.rows.push(r); else groups.push({ enc: r.encoding, rows: [r] }); });
         groups.forEach(g => g.rows.forEach((r, i) => {
           h += `<tr${i ? "" : ' class="pe-start"'}>` + (i ? "" : `<th rowspan="${g.rows.length}">${esc(g.enc)}</th>`) +
-            `<td>${r.teleport ? "Yes" : "No"}</td><td${r.best ? ' class="best"' : ""}>${esc(r.accuracy)}</td><td>${esc(r.epochSpeedup || "—")}</td><td>${esc(r.wallSpeedup || "—")}</td><td>${esc(r.timePerEpoch || "—")}</td></tr>`;
+            `<td style="text-align:left">${r.teleport ? "Yes" : "No"}</td><td${r.best ? ' class="best"' : ""}>${esc(r.accuracy)}</td><td>${esc(r.epochSpeedup || "—")}</td><td>${esc(r.wallSpeedup || "—")}</td><td>${esc(r.timePerEpoch || "—")}</td></tr>`;
         }));
       });
       document.getElementById("resultsTable").innerHTML = h + "</tbody></table>";
