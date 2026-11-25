@@ -710,10 +710,15 @@ def _try_scored_teleportation_impl(
     except ImportError:  # ``python src/lm/train.py`` import path
         from criteria.common import muon_groups
     groups = muon_groups(optimizer)
-    if requires_nesterov and any(not bool(group.get("nesterov", False)) for group in groups):
+    tele_nesterov_only = bool(getattr(args, "tele_nesterov_only", False))
+    if (
+        requires_nesterov
+        and not tele_nesterov_only
+        and any(not bool(group.get("nesterov", False)) for group in groups)
+    ):
         raise ValueError(
-            f"{method_name} requires every Muon parameter group to have nesterov=True; "
-            "construct the optimizer with --nesterov."
+            f"{method_name} requires Nesterov Muon updates or the explicit "
+            "--tele-nesterov-only mode."
         )
 
     score_scope = str(getattr(args, "csd_score_scope", "all_muon"))

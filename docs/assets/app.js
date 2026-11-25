@@ -75,7 +75,13 @@
       DATA.datasets.forEach(d => {
         h += `<tr class="dataset-row"><th colspan="6">${esc(d.name)}</th></tr>`;
         const groups = [];
-        d.rows.forEach(r => { const g = groups[groups.length - 1]; if (g && g.enc === r.encoding) g.rows.push(r); else groups.push({ enc: r.encoding, rows: [r] }); });
+        const rows = d.name === "ImageNet-1K"
+          ? [...d.rows].sort((a, b) => {
+              const rank = encoding => encoding === "APE" ? 0 : encoding === "RoPE" ? 1 : 2;
+              return rank(a.encoding) - rank(b.encoding);
+            })
+          : d.rows;
+        rows.forEach(r => { const g = groups[groups.length - 1]; if (g && g.enc === r.encoding) g.rows.push(r); else groups.push({ enc: r.encoding, rows: [r] }); });
         groups.forEach(g => g.rows.forEach((r, i) => {
           h += `<tr${i ? "" : ' class="pe-start"'}>` + (i ? "" : `<th rowspan="${g.rows.length}">${esc(g.enc)}</th>`) +
             `<td style="text-align:left">${r.teleport ? "Yes" : "No"}</td><td${r.best ? ' class="best"' : ""}>${esc(r.accuracy)}</td><td>${esc(r.epochSpeedup || "—")}</td><td>${esc(r.wallSpeedup || "—")}</td><td>${esc(r.timePerEpoch || "—")}</td></tr>`;

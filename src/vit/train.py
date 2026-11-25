@@ -55,10 +55,19 @@ def parse_args():
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for the auxiliary AdamW group when --opt=muon.")
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument(
+    momentum_group = parser.add_mutually_exclusive_group()
+    momentum_group.add_argument(
         "--nesterov",
         action="store_true",
-        help="Use Nesterov-corrected Muon updates instead of ordinary EMA Muon.",
+        help="Use Nesterov-corrected Muon updates throughout training (legacy behavior).",
+    )
+    momentum_group.add_argument(
+        "--tele-nesterov-only",
+        action="store_true",
+        help=(
+            "Keep ordinary EMA Muon updates during training, but use the Nesterov "
+            "direction when scoring Nesterov-CSD teleportation candidates."
+        ),
     )
     parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["step", "cosine", "plateau"])
     parser.add_argument("--n-teleport", type=int, default=0, help="number of naive teleport candidates")
@@ -134,7 +143,11 @@ def build_optimizer(model, args):
 
 def build_run_name(args):
     adam_lr_suffix = f"_adam-lr{args.adam_lr}" if args.opt == "muon" else ""
-    nesterov_suffix = "_nesterov" if args.nesterov else ""
+    nesterov_suffix = (
+        "_nesterov" if args.nesterov
+        else "_tele-nesterov-only" if args.tele_nesterov_only
+        else ""
+    )
     if args.tele_method == "none" and args.n_teleport <= 0:
         return (
             f"NoTeleport-lr{args.lr}{adam_lr_suffix}_{nesterov_suffix}_dataset{args.dataset}_batch{args.batch_size}_{args.opt}_embed{args.position_embedding}_seed{args.seed}"
@@ -182,13 +195,22 @@ def main():
     if args.nesterov and args.opt != "muon":
         raise ValueError("--nesterov requires --opt muon.")
 
+    if args.tele_nesterov_only:
+        if args.opt != "muon":
+            raise ValueError("--tele-nesterov-only requires --opt muon.")
+        if args.tele_method not in NESTEROV_CSD_METHODS:
+            raise ValueError(
+                "--tele-nesterov-only requires a Nesterov CSD --tele-method."
+            )
+
     if args.tele_method in NESTEROV_CSD_METHODS:
         if args.opt != "muon":
             raise ValueError("Nesterov CSD methods require --opt muon.")
-        if not args.nesterov:
+        if not (args.nesterov or args.tele_nesterov_only):
             raise ValueError(
-                "Nesterov CSD methods require --nesterov so the optimizer update "
-                "matches the direction used for CSD scoring."
+                "Nesterov CSD methods require either --nesterov (Nesterov Muon "
+                "updates throughout training) or --tele-nesterov-only (EMA Muon "
+                "updates with Nesterov used only for teleportation scoring)."
             )
 
     torch.set_float32_matmul_precision("high")
