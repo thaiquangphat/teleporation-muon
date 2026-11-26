@@ -73,15 +73,9 @@
     if (factsEl) factsEl.innerHTML = (DATA.facts || []).map(f => `<div><b>${esc(f.value)}</b><span>${esc(f.label)}</span></div>`).join("");
       let h = '<table class="results-table"><thead><tr><th>Encoding</th><th>Teleport</th><th>Accuracy ↑</th><th>Epoch speedup ↑</th><th>Wall-clock speedup ↑</th><th>Time/epoch ↓</th></tr></thead><tbody>';
       DATA.datasets.forEach(d => {
-        h += `<tr class="dataset-row"><th colspan="6">${esc(d.name)}</th></tr>`;
+        h += `<tr class="dataset-row"><th colspan="6">${esc(d.name)}${d.meta ? `<span style="font-weight:400;opacity:.7"> · ${esc(d.meta.metric)} ${esc(d.meta.better)} · speedup in ${esc(d.meta.xUnit)}</span>` : ""}</th></tr>`;
         const groups = [];
-        const rows = d.name === "ImageNet-1K"
-          ? [...d.rows].sort((a, b) => {
-              const rank = encoding => encoding === "APE" ? 0 : encoding === "RoPE" ? 1 : 2;
-              return rank(a.encoding) - rank(b.encoding);
-            })
-          : d.rows;
-        rows.forEach(r => { const g = groups[groups.length - 1]; if (g && g.enc === r.encoding) g.rows.push(r); else groups.push({ enc: r.encoding, rows: [r] }); });
+        d.rows.forEach(r => { const g = groups[groups.length - 1]; if (g && g.enc === r.encoding) g.rows.push(r); else groups.push({ enc: r.encoding, rows: [r] }); });
         groups.forEach(g => g.rows.forEach((r, i) => {
           h += `<tr${i ? "" : ' class="pe-start"'}>` + (i ? "" : `<th rowspan="${g.rows.length}">${esc(g.enc)}</th>`) +
             `<td style="text-align:left">${r.teleport ? "Yes" : "No"}</td><td${r.best ? ' class="best"' : ""}>${esc(r.accuracy)}</td><td>${esc(r.epochSpeedup || "—")}</td><td>${esc(r.wallSpeedup || "—")}</td><td>${esc(r.timePerEpoch || "—")}</td></tr>`;
@@ -99,7 +93,27 @@
       // Per-configuration validation accuracy (%), mean over five seeds with min–max bands.
       // epoch view: x = epoch. wall view: x = mean logged process time (s) at which each epoch finished.
               const state = { view: "epoch", dataset: 0 };
+      const noteEl = document.getElementById("chartNote"); // optional: the chart works without this element
+      const DEFAULT_NOTE = noteEl ? noteEl.textContent : "";
   
+      // Legend icons: Chart.js ignores borderDash for point-style legend entries, so draw the line (solid or dashed) ourselves.
+      const LEGEND_LINE = 26, LEGEND_GAP = 10; // line length and extra space (px) between the line and the series name
+      function legendIcon(color, dashed) {
+        const w = LEGEND_LINE + LEGEND_GAP, h = 8, dpr = window.devicePixelRatio || 1, c = document.createElement("canvas");
+        c.width = w * dpr; c.height = h * dpr;
+        const g = c.getContext("2d"); g.scale(dpr, dpr);
+        g.strokeStyle = color; g.lineWidth = 2.2; g.lineCap = "butt";
+        g.setLineDash(dashed ? [5, 4] : []);
+        g.beginPath(); g.moveTo(0, h / 2); g.lineTo(LEGEND_LINE, h / 2); g.stroke();
+        c.style.width = w + "px"; c.style.height = h + "px";
+        return c;
+      }
+      const legendLabels = chart => Chart.defaults.plugins.legend.labels.generateLabels(chart).map(item => {
+        const ds = chart.data.datasets[item.datasetIndex];
+        if (ds && !ds.bandHelper) item.pointStyle = legendIcon(ds.borderColor, !!(ds.borderDash && ds.borderDash.length));
+        return item;
+      });
+
       function seriesFor(view, dataset) { return curveData[view][dataset]; }
       function makeDatasets(seriesList) {
         const datasets = [];
@@ -121,11 +135,11 @@
           responsive: true, maintainAspectRatio: false,
           interaction: { mode: "index", intersect: false, axis: "x" },
           plugins: {
-            legend: { position: "bottom", labels: { usePointStyle: true, pointStyle: "line", boxWidth: 22, padding: 14, color: "#526176", font: { family: "Bricolage Grotesque, system-ui, sans-serif", size: 10, weight: "600" }, filter: (item, data) => !data.datasets[item.datasetIndex].bandHelper, sort: (a, b) => a.datasetIndex - b.datasetIndex } },
+            legend: { position: "bottom", labels: { usePointStyle: true, pointStyle: "line", generateLabels: legendLabels, boxWidth: LEGEND_LINE + LEGEND_GAP, padding: 14, color: "#526176", font: { family: "Bricolage Grotesque, system-ui, sans-serif", size: 10, weight: "600" }, filter: (item, data) => !data.datasets[item.datasetIndex].bandHelper, sort: (a, b) => a.datasetIndex - b.datasetIndex } },
             tooltip: { enabled: true, itemSort: (a, b) => a.datasetIndex - b.datasetIndex, filter: item => !item.dataset.bandHelper, backgroundColor: "#14243a", titleFont: { family: "monospace", size: 11 }, bodyFont: { family: "monospace", size: 11 }, padding: 11, cornerRadius: 6, displayColors: true,
               callbacks: {
-                title: items => state.view === "epoch" ? "Epoch " + items[0].parsed.x : "Epoch " + items[0].raw.e + " · " + items[0].parsed.x.toFixed(1) + " s",
-                label: ctx => " " + ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3) + "%"
+                title: items => { const mt = DATA.datasets[state.dataset].meta || {}, xl = mt.xLabel || "Epoch"; return state.view === "epoch" ? xl + " " + items[0].parsed.x : xl + " " + items[0].raw.e + " · " + items[0].parsed.x.toFixed(1) + " s"; },
+                label: ctx => { const mt = DATA.datasets[state.dataset].meta || {}; return " " + ctx.dataset.label + ": " + ctx.parsed.y.toFixed(3) + (mt.unit === undefined ? "%" : mt.unit); }
               } }
           },
           scales: {
@@ -139,24 +153,27 @@
       function render() {
         const { view, dataset } = state;
         const list = seriesFor(view, dataset);
-        const epochs = curveData.epoch[dataset][0].mean.length;
+        const mt = DATA.datasets[dataset].meta || {};
+        const em = curveData.epoch[dataset][0].mean, epochs = em[em.length - 1].x, xFirst = em[0].x;
         const xs = chart.options.scales.x;
         chart.data.datasets = makeDatasets(list);
         if (view === "epoch") {
-          xs.min = 1; xs.max = epochs; xs.ticks.stepSize = epochs <= 15 ? 1 : 5; xs.title.text = "Epoch";
+          xs.min = xFirst; xs.max = epochs; xs.ticks.stepSize = mt.xStep || (epochs <= 15 ? 1 : 5); xs.title.text = mt.xLabel || "Epoch";
           chart.options.interaction.mode = "index";
         } else {
           const tmax = totalTime(dataset);
           xs.min = 0; xs.max = Math.ceil(tmax / 25) * 25; xs.ticks.stepSize = undefined; xs.title.text = "Wall-clock time (s)";
           chart.options.interaction.mode = "nearest";
         }
+        chart.options.scales.y.title.text = mt.yLabel || "Validation accuracy (%)";
+        if (noteEl) noteEl.textContent = mt.note || DEFAULT_NOTE;
         document.getElementById("activeDatasetName").textContent = DATASETS[dataset];
-        document.getElementById("activeDatasetEpochs").textContent = view === "epoch" ? epochs + " epochs" : "up to ≈ " + Math.round(totalTime(dataset)) + " s";
+        document.getElementById("activeDatasetEpochs").textContent = view === "epoch" ? epochs + " " + (mt.xUnit || "epochs") : "up to ≈ " + Math.round(totalTime(dataset)) + " s";
         chartCanvas.setAttribute("aria-label", DATASETS[dataset] + " validation accuracy versus " + (view === "epoch" ? "epoch" : "wall-clock time"));
         document.querySelectorAll(".dataset-option").forEach(b => {
           const i = Number(b.dataset.dataset), sel = i === dataset;
           b.classList.toggle("is-selected", sel); b.setAttribute("aria-pressed", String(sel));
-          b.querySelector(".dataset-option-meta").textContent = view === "epoch" ? curveData.epoch[i][0].mean.length + " epochs" : "≈ " + Math.round(totalTime(i)) + " s";
+          const mi = DATA.datasets[i].meta || {}, ei = curveData.epoch[i][0].mean; b.querySelector(".dataset-option-meta").textContent = view === "epoch" ? ei[ei.length - 1].x + " " + (mi.xUnit || "epochs") : "≈ " + Math.round(totalTime(i)) + " s";
         });
         document.querySelectorAll(".view-option").forEach(b => {
           const sel = b.dataset.view === view;
