@@ -8493,8 +8493,8 @@
                     "teleport": true,
                     "accuracy": "49.66",
                     "best": true,
-                    "epochSpeedup": "0.00 %",
-                    "wallSpeedup": "−6.33 %",
+                    "epochSpeedup": "7.14 %",
+                    "wallSpeedup": "0.00 %",
                     "timePerEpoch": "233.9 s / 1k steps"
                 },
                 {
@@ -8511,8 +8511,8 @@
                     "teleport": true,
                     "accuracy": "45.80",
                     "best": true,
-                    "epochSpeedup": "6.67 %",
-                    "wallSpeedup": "41.27 %",
+                    "epochSpeedup": "11.11 %",
+                    "wallSpeedup": "0.00 %",
                     "timePerEpoch": "131.3 s / 1k steps"
                 }
             ],
